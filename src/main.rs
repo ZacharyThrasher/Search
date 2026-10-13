@@ -68,6 +68,10 @@ struct Cli {
     /// Do not print result paths (useful with --bench).
     #[arg(short, long)]
     quiet: bool,
+
+    /// Threads reading the MFT per volume (1 = serial, 0 = one per core).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    mft_threads: usize,
 }
 
 fn fmt_dur(d: Duration) -> String {
@@ -119,14 +123,20 @@ fn build_mft(cli: &Cli, builder: &mut Builder) -> Result<usize, String> {
     let mut denied = false;
     let mut done = 0;
     for letter in letters {
-        match mft::index_volume(letter, builder) {
+        let threads = if cli.mft_threads == 0 {
+            rayon::current_num_threads()
+        } else {
+            cli.mft_threads
+        };
+        match mft::index_volume(letter, builder, threads) {
             Ok(s) => {
                 done += 1;
                 eprintln!(
-                    "  {}: {:>12} entries ({} MFT records est.)  kernel read {}  parse {}  resolve {}  {} calls, {}",
+                    "  {}: {:>12} entries ({} MFT records est.)  read {} (summed ioctl {})  merge {}  resolve {}  {} calls, {}",
                     s.letter,
                     commas(s.entries),
                     commas(s.mft_records_estimate as usize),
+                    fmt_dur(s.enumerate),
                     fmt_dur(s.ioctl),
                     fmt_dur(s.parse),
                     fmt_dur(s.resolve),

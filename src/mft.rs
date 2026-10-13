@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Ioctl::{
 };
 
 use crate::index::Builder;
-use crate::usn::parse_enum_buffer;
+use crate::usn::{FRN_RECORD_MASK, parse_enum_buffer};
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const DRIVE_FIXED: u32 = 3;
@@ -121,9 +121,11 @@ pub struct VolumeStats {
     pub orphans: usize,
     /// Estimated MFT records (valid MFT length / record size).
     pub mft_records_estimate: u64,
-    /// Time spent inside `DeviceIoControl` (kernel reading the MFT).
+    /// Wall-clock time reading the MFT (all worker threads together).
+    pub enumerate: Duration,
+    /// Summed time inside `DeviceIoControl` across workers.
     pub ioctl: Duration,
-    /// Time spent decoding records and filling the index builder.
+    /// Time merging worker output into the index builder.
     pub parse: Duration,
     /// Time resolving parent links.
     pub resolve: Duration,
@@ -153,26 +155,32 @@ fn mft_record_estimate(vol: &Volume) -> u64 {
     }
 }
 
-/// Enumerate every file on `letter:` into `builder` as one volume.
-pub fn index_volume(letter: char, builder: &mut Builder) -> io::Result<VolumeStats> {
-    let vol = Volume::open(letter)?;
-    let mut stats = VolumeStats {
-        letter,
-        ..Default::default()
-    };
-    stats.mft_records_estimate = mft_record_estimate(&vol);
-    let est = stats.mft_records_estimate as usize;
-    builder.begin_volume(&format!("{letter}:"), ROOT_RECORD);
-    builder.reserve(est, est.saturating_mul(24));
+/// Entries gathered by one worker, kept compact until they are merged.
+#[derive(Default)]
+struct Chunk {
+    /// (record, parent, is_dir, end offset of the name in `names`)
+    recs: Vec<(u64, u64, bool, u32)>,
+    names: String,
+    ioctl: Duration,
+    calls: usize,
+    bytes: u64,
+}
 
+/// Enumerate records with number in `[start, end)` on `letter:`.
+/// `FSCTL_ENUM_USN_DATA` returns records in ascending order and accepts any
+/// starting reference number, so disjoint ranges can run on separate threads.
+fn enum_range(letter: char, start: u64, end: u64) -> io::Result<Chunk> {
+    let vol = Volume::open(letter)?;
+    let mut chunk = Chunk::default();
     let mut input = MftEnumData {
-        start_file_reference_number: 0,
+        start_file_reference_number: start,
         low_usn: 0,
         high_usn: i64::MAX,
     };
     let mut out = vec![0u8; BUF_BYTES];
     let mut name = String::new();
-    loop {
+    let mut last = start;
+    'outer: loop {
         let mut ret = 0u32;
         let t = Instant::now();
         // SAFETY: input/out are valid for the sizes passed; `ret` is writable.
@@ -195,30 +203,123 @@ pub fn index_volume(letter: char, builder: &mut Builder) -> io::Result<VolumeSta
         } else {
             0
         };
-        stats.ioctl += t.elapsed();
-        stats.ioctl_calls += 1;
+        chunk.ioctl += t.elapsed();
+        chunk.calls += 1;
         if ok == 0 {
             if err == ERROR_HANDLE_EOF {
                 break;
             }
             return Err(io::Error::from_raw_os_error(err as i32));
         }
-        stats.bytes += ret as u64;
+        chunk.bytes += ret as u64;
 
-        let t = Instant::now();
-        let buf = &out[..ret as usize];
-        let next = parse_enum_buffer(buf, |e| {
+        let mut past_end = false;
+        let mut disordered = false;
+        let next = parse_enum_buffer(&out[..ret as usize], |e| {
+            if e.record >= end {
+                past_end = true;
+                return;
+            }
+            if e.record < last {
+                disordered = true;
+            }
+            last = e.record;
             if e.record == ROOT_RECORD {
                 return; // the root is synthesized by begin_volume
             }
             e.decode_name(&mut name);
-            builder.push(e.record, e.parent, &name, e.is_dir());
-            stats.entries += 1;
+            chunk.names.push_str(&name);
+            chunk
+                .recs
+                .push((e.record, e.parent, e.is_dir(), chunk.names.len() as u32));
         })
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        stats.parse += t.elapsed();
+        if disordered {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FSCTL_ENUM_USN_DATA returned records out of order",
+            ));
+        }
+        if past_end || (next & FRN_RECORD_MASK) >= end {
+            break 'outer;
+        }
         input.start_file_reference_number = next;
     }
+    Ok(chunk)
+}
+
+/// Enumerate every file on `letter:` into `builder` as one volume.
+/// `threads == 1` reads serially; larger values split the record-number space
+/// into ranges that are enumerated concurrently.
+pub fn index_volume(
+    letter: char,
+    builder: &mut Builder,
+    threads: usize,
+) -> io::Result<VolumeStats> {
+    let est = {
+        let vol = Volume::open(letter)?;
+        mft_record_estimate(&vol)
+    };
+    let mut stats = VolumeStats {
+        letter,
+        mft_records_estimate: est,
+        ..Default::default()
+    };
+
+    // Range boundaries over [0, est); the last range is open-ended.
+    let threads = threads.max(1);
+    let ranges = if threads == 1 || est < 100_000 {
+        1
+    } else {
+        threads * 2
+    };
+    let bounds: Vec<(u64, u64)> = (0..ranges as u64)
+        .map(|k| {
+            let a = k * est / ranges as u64;
+            let b = if k + 1 == ranges as u64 {
+                u64::MAX
+            } else {
+                (k + 1) * est / ranges as u64
+            };
+            (a, b)
+        })
+        .collect();
+
+    let t = Instant::now();
+    let chunks: Vec<io::Result<Chunk>> = if ranges == 1 {
+        vec![enum_range(letter, 0, u64::MAX)]
+    } else {
+        use rayon::prelude::*;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(io::Error::other)?;
+        pool.install(|| {
+            bounds
+                .par_iter()
+                .map(|&(a, b)| enum_range(letter, a, b))
+                .collect()
+        })
+    };
+    stats.enumerate = t.elapsed();
+    let chunks = chunks.into_iter().collect::<io::Result<Vec<_>>>()?;
+
+    let t = Instant::now();
+    builder.begin_volume(&format!("{letter}:"), ROOT_RECORD);
+    builder.reserve(est as usize, est as usize * 24);
+    for c in &chunks {
+        stats.ioctl += c.ioctl;
+        stats.ioctl_calls += c.calls;
+        stats.bytes += c.bytes;
+        let mut at = 0usize;
+        for &(record, parent, is_dir, end) in &c.recs {
+            let end = end as usize;
+            builder.push(record, parent, &c.names[at..end], is_dir);
+            at = end;
+        }
+        stats.entries += c.recs.len();
+    }
+    stats.parse = t.elapsed();
 
     let t = Instant::now();
     stats.orphans = builder.end_volume();
