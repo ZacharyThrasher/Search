@@ -110,6 +110,7 @@ function Invoke-Request([IO.FileInfo]$file) {
     try {
         $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $psArgs -WorkingDirectory (Split-Path (Split-Path $script -Parent) -Parent) `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+        $null = $p.Handle   # without this, ExitCode comes back empty after a timed WaitForExit
         if (-not $p.WaitForExit($TimeoutMinutes * 60 * 1000)) {
             $timedOut = $true
             & taskkill.exe /PID $p.Id /T /F | Out-Null
