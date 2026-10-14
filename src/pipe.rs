@@ -158,8 +158,10 @@ pub fn serve(
                 live.fetch_add(1, Ordering::AcqRel);
                 let (handler, live2) = (handler.clone(), live.clone());
                 let spawned = thread::Builder::new().name("pipe-conn".into()).spawn(move || {
+                    // Released even if the handler panics, so a bad request cannot
+                    // use up the connection slots one by one.
+                    let _slot = Slot(live2);
                     let _ = connection(file, &*handler);
-                    live2.fetch_sub(1, Ordering::AcqRel);
                 });
                 if spawned.is_err() {
                     live.fetch_sub(1, Ordering::AcqRel);
@@ -170,6 +172,15 @@ pub fn serve(
             unsafe { CloseHandle(h) };
         }
         h = create_instance(name, &sid, false)?;
+    }
+}
+
+/// One of the `MAX_CONNECTIONS` slots; frees itself on drop.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

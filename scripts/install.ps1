@@ -21,7 +21,8 @@
 
   To update after a rebuild, run this script again (it stops both programs,
   replaces the files, and restarts them). Remove everything with uninstall.ps1.
-  Snapshots, config and logs stay in %LOCALAPPDATA%\Search.
+  The helper keeps its snapshots and log in C:\Program Files\Search\data (admin-write
+  only, readable by you); the popup keeps its config and log in %LOCALAPPDATA%\Search.
 
 .EXAMPLE
   .\scripts\install.ps1
@@ -62,6 +63,15 @@ if ($HelperStep) {
         # Program Files is admin-write by default; make sure nothing weaker was inherited.
         & icacls.exe $progDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'could not lock down the program folder' }
+
+        # Snapshots and the helper's log go in a subfolder of it. The helper is elevated, so it
+        # must never write where a normal process could plant a link (junction, symlink, hard
+        # link) to redirect the write; this folder only admins can change. Only you and admins
+        # can read it, because the snapshots list every file name on the machine.
+        $dataDir = Join-Path $progDir 'data'
+        New-Item -ItemType Directory -Force $dataDir | Out-Null
+        & icacls.exe $dataDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${userSid}:(OI)(CI)RX" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'could not lock down the data folder' }
 
         $action = New-ScheduledTaskAction -Execute (Join-Path $progDir 'searchd.exe')
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $User

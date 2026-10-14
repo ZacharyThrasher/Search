@@ -78,7 +78,7 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 0)]
     mft_threads: usize,
 
-    /// Where snapshots are kept (default: %LOCALAPPDATA%\Search).
+    /// Where snapshots are kept (default: %LOCALAPPDATA%\Search, or C:\Program Files\Search\data when elevated).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
 
@@ -127,12 +127,6 @@ fn drive_of(path: &Path) -> Option<char> {
     }
 }
 
-fn default_data_dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|d| PathBuf::from(d).join("Search"))
-        .unwrap_or_else(|| std::env::temp_dir().join("Search"))
-}
-
 #[cfg(windows)]
 fn mft_sources(cli: &Cli) -> Result<Vec<Arc<dyn search::live::Source>>, String> {
     use search::mft::{self, NtfsSource};
@@ -169,7 +163,7 @@ fn mft_sources(_: &Cli) -> Result<Vec<Arc<dyn search::live::Source>>, String> {
 
 fn config(cli: &Cli, tail: bool) -> Config {
     Config {
-        data_dir: (!cli.no_snapshot).then(|| cli.data_dir.clone().unwrap_or_else(default_data_dir)),
+        data_dir: (!cli.no_snapshot).then(|| cli.data_dir.clone().unwrap_or_else(search::sys::default_data_dir)),
         tail,
         force_rescan: cli.rescan,
         log: Arc::new(|line| eprintln!("{line}")),

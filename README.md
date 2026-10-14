@@ -12,7 +12,7 @@ An in-RAM filename index that stays current while you work and restarts without 
 
 - **Index**: one flat, case-folded name buffer plus parent links. A query is a single parallel SIMD substring scan; paths are rebuilt on demand. It can be edited in place: new names are appended, removed names are tombstoned (and squeezed out later), and renaming or moving a folder never touches its children.
 - **Live updates**: after loading, a tail thread per volume polls the NTFS USN journal every 100 ms and applies creates, renames and deletes. A change shows up in the next query.
-- **Snapshot**: each volume's index is saved to `%LOCALAPPDATA%\Search\<drive>.snap` together with the journal ID and position. On start the snapshot is loaded and only the journal records since it was written are replayed, so a restart takes about a second instead of a full MFT scan.
+- **Snapshot**: each volume's index is saved to `<data folder>\<drive>.snap` (`%LOCALAPPDATA%\Search`, or `C:\Program Files\Search\data` when elevated) together with the journal ID and position. On start the snapshot is loaded and only the journal records since it was written are replayed, so a restart takes about a second instead of a full MFT scan.
 - **Source `mft`** (default): enumerates NTFS volumes with `FSCTL_ENUM_USN_DATA`, no directory walking. Needs an **elevated** shell (raw volume handle).
 - **Source `walk`**: parallel directory walk. No elevation, any file system. Slower, static (no live updates, no snapshot); also the ground truth for the MFT path.
 
@@ -92,7 +92,7 @@ Names only (no content search yet). Three programs:
 
 - The helper is copied to `C:\Program Files\Search` (admin-write only, so an unprivileged process cannot swap the exe that runs elevated) and run by the scheduled task `SearchHelper` at your logon with highest privileges. The popup starts via `HKCU\...\Run`. Updating means running `install.ps1` again.
 - If the helper is not running when you search, the popup starts the task itself and says "Starting the search helper…". While the index loads it says "Still indexing…".
-- Logs: `%LOCALAPPDATA%\Search\searchd.log` and `searchpop.log`. Snapshots live in the same folder.
+- The helper's snapshots and log (`searchd.log`) live in `C:\Program Files\Search\data`: the helper is elevated, so it must not write to a folder a normal process could redirect with a junction or link. The popup's log (`searchpop.log`) and config stay in `%LOCALAPPDATA%\Search`. Any elevated run (the helper, or `s` in an admin terminal) uses the Program Files folder unless you pass `--data-dir`.
 
 ### Keys
 
@@ -132,6 +132,7 @@ theme = "system"         # or "dark" / "light"
 ### Know before you rely on it
 
 - **Any process running as you can read the index** through the pipe, including names inside folders your account cannot list (the helper reads the MFT as admin). It sees names only, never contents, and cannot make the helper run anything.
+- The pipe name is predictable. If another account on the same PC created `\\.\pipe\SearchHelper-<your SID>` before the helper did, the popup would talk to it. Not defended on this single-user PC; the fix would be to check the server's exe path before trusting a reply.
 - The helper keeps the whole index in RAM (about 51 B per entry, so roughly 800 MB for 15.7 M files).
 - The helper saves snapshots hourly when worth it (see the snapshot rules above) and on a clean `Shutdown`. A logoff or crash loses nothing: the next start replays the USN journal.
 - `searchd --walk DIR` indexes a folder without elevation (static; handy for trying the popup); `searchd --console` echoes the log to the terminal it was started from.

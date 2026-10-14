@@ -542,6 +542,8 @@ mod app {
             // SAFETY: buffer length passed matches the allocation.
             let n = unsafe { GetWindowTextW(self.edit, buf.as_mut_ptr(), buf.len() as i32) } as usize;
             let text = String::from_utf16_lossy(&buf[..n]);
+            // The helper refuses queries over its limit; search the start of a long paste.
+            let text = search::ipc::clamp_query(&text).to_string();
             if text == self.query {
                 return;
             }
@@ -617,14 +619,17 @@ mod app {
                 return;
             }
             let (_, folder) = split_path(&path);
+            // These buffers must outlive the call: a temporary created inside the
+            // `if` branch below would be freed before ShellExecute reads it.
+            let (verb, file, dir) = (wide("open"), wide(&path), wide(folder));
             // SAFETY: NUL-terminated strings; ShellExecute copies them.
             let r = unsafe {
                 ShellExecuteW(
                     null_mut(),
-                    wide("open").as_ptr(),
-                    wide(&path).as_ptr(),
+                    verb.as_ptr(),
+                    file.as_ptr(),
                     null(),
-                    if folder.is_empty() { null() } else { wide(folder).as_ptr() },
+                    if folder.is_empty() { null() } else { dir.as_ptr() },
                     SW_SHOWNORMAL,
                 ) as usize
             };

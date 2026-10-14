@@ -45,7 +45,8 @@ mod imp {
         /// Drive letter(s) to index (default: every fixed NTFS drive).
         #[arg(short = 'v', long = "volume")]
         volumes: Vec<String>,
-        /// Where snapshots and the log live (default: %LOCALAPPDATA%\Search).
+        /// Where snapshots and the log live (default: C:\Program Files\Search\data
+        /// when elevated, which only admins can change; else %LOCALAPPDATA%\Search).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Print the log to the terminal this was started from.
@@ -197,11 +198,7 @@ mod imp {
         sys::quiet_errors();
         let cli = Cli::parse();
         let echo = cli.console && sys::attach_parent_console();
-        let data_dir = cli.data_dir.clone().unwrap_or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .map(|d| PathBuf::from(d).join("Search"))
-                .unwrap_or_else(|| std::env::temp_dir().join("Search"))
-        });
+        let data_dir = cli.data_dir.clone().unwrap_or_else(sys::default_data_dir);
         let log = Arc::new(Log::open(&data_dir, echo));
         let elevated = sys::is_elevated();
         log.line(&format!(

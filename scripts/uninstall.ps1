@@ -2,7 +2,8 @@
 .SYNOPSIS
   Remove what install.ps1 set up: the SearchHelper task, the files in
   C:\Program Files\Search, the popup autostart and its copy of the exe.
-  Asks for admin once. Snapshots, config and logs in %LOCALAPPDATA%\Search
+  Asks for admin once. The helper's snapshots and log go with
+  C:\Program Files\Search; the popup's config and log in %LOCALAPPDATA%\Search
   are kept unless you pass -RemoveData.
 #>
 param(

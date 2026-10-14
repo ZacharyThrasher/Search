@@ -29,6 +29,19 @@ pub const STATUS_LOADING: u8 = 1;
 /// The request was refused; the body is a message.
 pub const STATUS_ERROR: u8 = 2;
 
+/// `query` cut to at most `MAX_QUERY_BYTES` bytes at a character boundary, so
+/// a very long paste is searched by its start instead of being refused.
+pub fn clamp_query(query: &str) -> &str {
+    if query.len() <= MAX_QUERY_BYTES {
+        return query;
+    }
+    let mut end = MAX_QUERY_BYTES;
+    while !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    &query[..end]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KindFilter {
     Any,
@@ -379,6 +392,19 @@ mod tests {
         many.extend_from_slice(&0u64.to_le_bytes());
         many.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(Reply::decode(&many).is_err());
+    }
+
+    #[test]
+    fn long_queries_are_clamped_to_what_the_helper_accepts() {
+        assert_eq!(clamp_query("abc"), "abc");
+        let long = "a".repeat(MAX_QUERY_BYTES + 50);
+        assert_eq!(clamp_query(&long).len(), MAX_QUERY_BYTES);
+        // Never splits a multi-byte character (here 3 bytes each, 1024 = 341 * 3 + 1).
+        let wide = "\u{20AC}".repeat(400);
+        let cut = clamp_query(&wide);
+        assert_eq!(cut.len(), 341 * 3);
+        let r = Request::Search { query: cut.into(), limit: 5, kind: KindFilter::Any };
+        assert_eq!(Request::decode(&r.encode()).unwrap(), r);
     }
 
     #[test]

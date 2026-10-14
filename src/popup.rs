@@ -248,6 +248,12 @@ pub fn highlight_ranges(name: &str, query: &str) -> Vec<Range<usize>> {
             _ => merged.push(s),
         }
     }
+    // Folding can move characters while keeping the total length (a 2-byte
+    // capital that lowercases to 3 bytes next to a 3-byte one that shrinks to 2),
+    // so offsets in the folded text may not be boundaries in `name`.
+    if merged.iter().any(|r| !name.is_char_boundary(r.start) || !name.is_char_boundary(r.end)) {
+        return Vec::new();
+    }
     merged
 }
 
@@ -386,6 +392,8 @@ mod tests {
         assert_eq!(highlight_ranges("Résumé.pdf", "RÉSUMÉ"), vec![0..8]);
         // 'İ' lowercases to two chars; positions would drift, so no highlight.
         assert!(highlight_ranges("İstanbul", "stan").is_empty());
+        // Same total length but shifted boundaries ('Ⱥ' 2->3 bytes, 'Ɱ' 3->2): must not panic.
+        assert!(highlight_ranges("\u{23A}\u{2C6E}", "\u{271}").is_empty());
     }
 
     #[test]

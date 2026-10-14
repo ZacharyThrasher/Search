@@ -64,6 +64,27 @@ pub fn is_elevated() -> bool {
     false
 }
 
+/// Where snapshots and logs go when no folder is given.
+///
+/// A normal process uses `%LOCALAPPDATA%\Search`. An elevated one must not: any
+/// unelevated process can replace that folder with a junction or plant links in
+/// it, and the elevated process would then create and overwrite files wherever
+/// they point. It uses `C:\Program Files\Search\data` instead, which only
+/// admins can change (see `scripts\install.ps1`).
+pub fn default_data_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if is_elevated() {
+        return env("ProgramFiles")
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+            .join("Search")
+            .join("data");
+    }
+    env("LOCALAPPDATA")
+        .map(|d| d.join("Search"))
+        .unwrap_or_else(|| std::env::temp_dir().join("Search"))
+}
+
 /// For a program built with the Windows (no console) subsystem: if it was
 /// started from a terminal, write to that terminal. Returns whether it did.
 #[cfg(windows)]
