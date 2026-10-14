@@ -9,6 +9,7 @@ pub mod live;
 pub mod mft;
 #[cfg(windows)]
 pub mod pipe;
+pub mod pathdfa;
 pub mod popup;
 pub mod query;
 pub mod selftest;

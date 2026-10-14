@@ -128,19 +128,41 @@ pub struct Glob {
     anchor_start: bool,
     anchor_end: bool,
     wild: bool,
+    shape: Shape,
+}
+
+/// The common single-literal patterns get a direct test.
+#[derive(Clone, Copy)]
+enum Shape {
+    Contains,
+    Prefix,
+    Suffix,
+    Exact,
+    General,
 }
 
 impl Glob {
     fn new(pattern: &[u8], anchor_start: bool, anchor_end: bool) -> Glob {
+        let segs: Vec<Seg> = pattern
+            .split(|&b| b == b'*')
+            .filter(|s| !s.is_empty())
+            .map(Seg::new)
+            .collect();
+        let shape = match (&segs[..], anchor_start, anchor_end) {
+            ([s], a, b) if s.finder.is_some() => match (a, b) {
+                (false, false) => Shape::Contains,
+                (true, false) => Shape::Prefix,
+                (false, true) => Shape::Suffix,
+                (true, true) => Shape::Exact,
+            },
+            _ => Shape::General,
+        };
         Glob {
-            segs: pattern
-                .split(|&b| b == b'*')
-                .filter(|s| !s.is_empty())
-                .map(Seg::new)
-                .collect(),
+            segs,
             anchor_start,
             anchor_end,
             wild: pattern.iter().any(|&b| b == b'*' || b == b'?'),
+            shape,
         }
     }
 
@@ -171,8 +193,18 @@ impl Glob {
         !self.wild
     }
 
+    #[inline]
     pub fn matches(&self, name: &[u8]) -> bool {
-        self.run(name, None)
+        match self.shape {
+            Shape::Contains => self.segs[0]
+                .finder
+                .as_ref()
+                .is_some_and(|f| f.find(name).is_some()),
+            Shape::Prefix => name.starts_with(&self.segs[0].bytes),
+            Shape::Suffix => name.ends_with(&self.segs[0].bytes),
+            Shape::Exact => name == self.segs[0].bytes.as_slice(),
+            Shape::General => self.run(name, None),
+        }
     }
 
     fn run(&self, name: &[u8], mut out: Option<&mut Vec<Range<usize>>>) -> bool {
@@ -255,6 +287,17 @@ impl Glob {
         best
     }
 
+    /// `*.png`-shaped patterns (the last run is exactly a dot and an
+    /// extension, nothing longer can narrow it further): the extension.
+    fn ext_only(&self) -> Option<Vec<u8>> {
+        if !self.anchor_end || self.segs.is_empty() {
+            return None;
+        }
+        let last = self.segs.last()?;
+        let e = last.bytes.strip_prefix(b".")?;
+        (!e.is_empty() && !e.contains(&b'.') && !e.contains(&b'?')).then(|| e.to_vec())
+    }
+
     /// For an end-anchored path pattern: the literal text after its last `\`,
     /// which can only sit in the file name, plus the terminating NUL.
     fn name_suffix_fragment(&self) -> Option<Vec<u8>> {
@@ -318,7 +361,68 @@ pub enum TermKind {
     /// Matched case-insensitively on the name as stored (original case).
     Regex(Regex, Option<Vec<Vec<u8>>>),
     /// Matched on the folded full path.
-    Path(Glob),
+    Path(PathTerm),
+}
+
+/// A path term: the glob, plus what it takes to rebuild it as a streaming
+/// matcher over directory paths.
+pub struct PathTerm {
+    pub glob: Glob,
+    /// The folded pattern, `*` and `?` included.
+    pub pattern: Vec<u8>,
+    pub anchor_start: bool,
+    pub anchor_end: bool,
+    /// Position among the query's path terms (index into the per-search matchers).
+    pub slot: usize,
+}
+
+/// Something to look for to find the candidates of a term.
+pub(crate) enum DriverAlt {
+    /// Bytes inside the flat folded name buffer.
+    Bytes(Vec<u8>),
+    /// Names whose extension (text after the last dot) is this.
+    Ext(Vec<u8>),
+}
+
+impl DriverAlt {
+    /// Rough selectivity: longer is rarer.
+    fn weight(&self) -> usize {
+        match self {
+            DriverAlt::Bytes(b) => b.len(),
+            DriverAlt::Ext(e) => e.len() + 2,
+        }
+    }
+}
+
+/// A resolved driver the index scans for.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Driver {
+    Bytes(memmem::Finder<'static>),
+    Ext(u16),
+}
+
+/// 16-bit hash of a folded extension; 0 is "no extension". Collisions are
+/// fine: candidates are always verified.
+pub fn ext_hash(ext: &[u8]) -> u16 {
+    if ext.is_empty() {
+        return 0;
+    }
+    let mut h: u32 = 0x811C_9DC5;
+    for &b in ext {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    match (h ^ (h >> 16)) as u16 {
+        0 => 1,
+        v => v,
+    }
+}
+
+/// The extension of a folded name: the text after its last dot.
+pub fn name_ext(lower: &[u8]) -> &[u8] {
+    match lower.iter().rposition(|&b| b == b'.') {
+        Some(d) => &lower[d + 1..],
+        None => &[],
+    }
 }
 
 pub struct Term {
@@ -336,38 +440,57 @@ impl Term {
         }
     }
 
-    /// Does the term, ignoring negation, match? `path` builds the folded full
-    /// path only if a path term asks for it.
-    fn hit(&self, lower: &[u8], orig: &[u8], path: &mut dyn PathSource) -> bool {
+    /// Does the term, ignoring negation, match? A path term asks `ctx` for a
+    /// quick verdict first and builds the full path only if it has none.
+    fn hit(&self, lower: &[u8], orig: &[u8], ctx: &mut dyn EntryCtx) -> bool {
         match &self.kind {
             TermKind::Name(g) => g.matches(lower),
             TermKind::Ext(sfx) => sfx.iter().any(|s| lower.ends_with(s)),
             TermKind::Regex(r, _) => r.is_match(orig),
-            TermKind::Path(g) => g.matches(path.folded()),
+            TermKind::Path(p) => match ctx.path_verdict(p.slot, lower) {
+                Some(v) => v,
+                None => p.glob.matches(ctx.folded_path()),
+            },
         }
     }
 
-    /// Alternatives of which at least one must occur in the flat name buffer
-    /// for this (positive) term to match, if it has any literal to offer.
-    fn driver_alternatives(&self) -> Option<Vec<Vec<u8>>> {
+    /// Alternatives of which at least one must hold for this (positive) term
+    /// to match, if it has any literal to offer.
+    fn driver_alternatives(&self) -> Option<Vec<DriverAlt>> {
         match &self.kind {
-            TermKind::Name(g) => g.best_fragment().map(|f| vec![f]),
+            TermKind::Name(g) => g
+                .ext_only()
+                .map(|e| vec![DriverAlt::Ext(e)])
+                .or_else(|| g.best_fragment().map(|f| vec![DriverAlt::Bytes(f)])),
             TermKind::Ext(sfx) => Some(
                 sfx.iter()
                     .map(|s| {
-                        let mut v = s.clone();
-                        v.push(0);
-                        v
+                        // `.png` is a lookup in the extension column; `.tar.gz` is rarer as bytes.
+                        if s[1..].contains(&b'.') {
+                            let mut v = s.clone();
+                            v.push(0);
+                            DriverAlt::Bytes(v)
+                        } else {
+                            DriverAlt::Ext(s[1..].to_vec())
+                        }
                     })
                     .collect(),
             ),
-            TermKind::Path(g) => g.name_suffix_fragment().map(|f| vec![f]),
-            TermKind::Regex(_, lits) => lits.clone(),
+            TermKind::Path(p) => p
+                .glob
+                .name_suffix_fragment()
+                .map(|f| vec![DriverAlt::Bytes(f)]),
+            TermKind::Regex(_, lits) => lits
+                .as_ref()
+                .map(|l| l.iter().cloned().map(DriverAlt::Bytes).collect()),
         }
     }
 
     /// Whether finding the driver is the whole test, so it needs no recheck.
-    fn exact_by_driver(&self) -> bool {
+    fn exact_by_driver(&self, alts: &[DriverAlt]) -> bool {
+        if alts.iter().any(|a| matches!(a, DriverAlt::Ext(_))) {
+            return false; // the extension column is a hash: verify
+        }
         match &self.kind {
             TermKind::Name(g) => g.is_plain(),
             TermKind::Ext(_) => true,
@@ -376,9 +499,12 @@ impl Term {
     }
 }
 
-/// Lazily built, case-folded full path of the entry being tested.
-pub trait PathSource {
-    fn folded(&mut self) -> &[u8];
+/// What the scan knows about the entry being tested, beyond its name.
+pub trait EntryCtx {
+    /// Case-folded full path of the entry (built on first use).
+    fn folded_path(&mut self) -> &[u8];
+    /// Quick answer for path term `slot`, if the index can give one.
+    fn path_verdict(&mut self, slot: usize, lower: &[u8]) -> Option<bool>;
 }
 
 /// Terms joined by AND.
@@ -401,9 +527,14 @@ pub struct Query {
     ranking: Ranking,
     /// Fragments to scan the name buffer for; every match of the query contains
     /// at least one. `None` when some group has nothing to offer (full scan).
-    pub(crate) drivers: Option<Vec<memmem::Finder<'static>>>,
+    pub(crate) drivers: Option<Vec<Driver>>,
     /// Term of the single group whose test the driver already performs.
     pub(crate) skip: Option<usize>,
+    /// Some term reads the name in its original case (a regex).
+    pub(crate) needs_orig: bool,
+    /// Path term every match has to satisfy (a positive one in a lone group):
+    /// its directory verdict can reject an entry before anything else runs.
+    pub(crate) prefilter: Option<usize>,
 }
 
 enum Tok {
@@ -506,7 +637,14 @@ fn build_term(word: &str) -> Result<Option<Term>, ()> {
         return Ok(None);
     }
     let kind = if is_path {
-        TermKind::Path(Glob::path(&pat))
+        let glob = Glob::path(&pat);
+        TermKind::Path(PathTerm {
+            anchor_start: glob.anchor_start,
+            anchor_end: glob.anchor_end,
+            glob,
+            pattern: pat.clone(),
+            slot: 0,
+        })
     } else {
         TermKind::Name(Glob::name(&pat))
     };
@@ -547,14 +685,34 @@ impl Query {
         if invalid {
             groups.clear();
         }
+        let mut slot = 0;
+        for t in groups.iter_mut().flat_map(|g| g.terms.iter_mut()) {
+            if let TermKind::Path(p) = &mut t.kind {
+                p.slot = slot;
+                slot += 1;
+            }
+        }
         let ranking = Query::ranking_for(&groups);
         let (drivers, skip) = Query::plan_drivers(&groups);
+        let needs_orig = groups
+            .iter()
+            .flat_map(|g| &g.terms)
+            .any(|t| matches!(t.kind, TermKind::Regex(..)));
+        let prefilter = match groups.as_slice() {
+            [g] => g.terms.iter().find_map(|t| match &t.kind {
+                TermKind::Path(p) if !t.neg => Some(p.slot),
+                _ => None,
+            }),
+            _ => None,
+        };
         Query {
             invalid,
             groups,
             ranking,
             drivers,
             skip,
+            needs_orig,
+            prefilter,
         }
     }
 
@@ -580,11 +738,11 @@ impl Query {
     }
 
     /// Best positive term of each group to scan for, if every group has one.
-    fn plan_drivers(groups: &[Group]) -> (Option<Vec<memmem::Finder<'static>>>, Option<usize>) {
-        let mut finders = Vec::new();
+    fn plan_drivers(groups: &[Group]) -> (Option<Vec<Driver>>, Option<usize>) {
+        let mut drivers = Vec::new();
         let mut skip = None;
         for g in groups {
-            // Prefer the term whose shortest alternative is longest (rarest).
+            // Prefer the term whose weakest alternative is the rarest.
             let best = g
                 .terms
                 .iter()
@@ -593,19 +751,37 @@ impl Query {
                 .filter_map(|(i, t)| t.driver_alternatives().map(|a| (i, a)))
                 .max_by_key(|(_, a)| {
                     (
-                        a.iter().map(Vec::len).min().unwrap_or(0),
+                        a.iter().map(DriverAlt::weight).min().unwrap_or(0),
                         usize::MAX - a.len(),
                     )
                 });
             let Some((i, alts)) = best else {
                 return (None, None);
             };
-            if groups.len() == 1 && g.terms[i].exact_by_driver() {
+            if groups.len() == 1 && g.terms[i].exact_by_driver(&alts) {
                 skip = Some(i);
             }
-            finders.extend(alts.iter().map(|a| memmem::Finder::new(a).into_owned()));
+            drivers.extend(alts.into_iter().map(|a| match a {
+                DriverAlt::Bytes(b) => Driver::Bytes(memmem::Finder::new(&b).into_owned()),
+                DriverAlt::Ext(e) => Driver::Ext(ext_hash(&e)),
+            }));
         }
-        (Some(finders), skip)
+        (Some(drivers), skip)
+    }
+
+    /// The query's path terms, in `slot` order.
+    pub fn path_terms(&self) -> Vec<&PathTerm> {
+        let mut v: Vec<&PathTerm> = self
+            .groups
+            .iter()
+            .flat_map(|g| &g.terms)
+            .filter_map(|t| match &t.kind {
+                TermKind::Path(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        v.sort_by_key(|p| p.slot);
+        v
     }
 
     /// No usable term at all (blank, or only quotes and bangs).
@@ -639,7 +815,7 @@ impl Query {
         &self,
         lower: &[u8],
         orig: &[u8],
-        path: &mut dyn PathSource,
+        ctx: &mut dyn EntryCtx,
         driven: bool,
     ) -> bool {
         if self.invalid {
@@ -648,7 +824,7 @@ impl Query {
         self.groups.is_empty()
             || self.groups.iter().any(|g| {
                 g.terms.iter().enumerate().all(|(i, t)| {
-                    (driven && self.skip == Some(i)) || t.hit(lower, orig, path) != t.neg
+                    (driven && self.skip == Some(i)) || t.hit(lower, orig, ctx) != t.neg
                 })
             })
     }
@@ -656,9 +832,12 @@ impl Query {
     /// Reference matcher on a full path (`C:\a\b.txt`); the last component is the name.
     pub fn matches_path(&self, full_path: &str) -> bool {
         struct P(Vec<u8>);
-        impl PathSource for P {
-            fn folded(&mut self) -> &[u8] {
+        impl EntryCtx for P {
+            fn folded_path(&mut self) -> &[u8] {
                 &self.0
+            }
+            fn path_verdict(&mut self, _: usize, _: &[u8]) -> Option<bool> {
+                None
             }
         }
         let name = full_path.rsplit('\\').next().unwrap_or(full_path);

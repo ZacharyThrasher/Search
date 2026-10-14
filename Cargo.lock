@@ -319,6 +319,7 @@ dependencies = [
  "memchr",
  "rayon",
  "regex",
+ "regex-automata",
  "regex-syntax",
  "rustc-hash",
  "tempfile",

@@ -348,6 +348,7 @@ fn catch_up(
         for c in &buf {
             apply(&mut st.index, c, &mut total);
         }
+        st.index.settle();
         let progressed = next > *usn;
         *usn = (*usn).max(next);
         if buf.is_empty() || !progressed {
@@ -763,6 +764,7 @@ fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
                         for c in &buf {
                             apply(&mut st.index, c, &mut stats);
                         }
+                        st.index.settle();
                         v.next_usn.fetch_max(next, Ordering::AcqRel);
                     }
                     let n = stats.total() as u64;

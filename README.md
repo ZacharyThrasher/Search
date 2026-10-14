@@ -56,7 +56,7 @@ Snapshots are rewritten on exit or every 6 h only when worth it: more than 20,00
 
 ### Known limits
 
-- Name-only matching; no path matching, wildcards or regex yet (the CLI lists in index order; the popup ranks).
+- Name matching with wildcards, paths and regex (see [Query syntax](#query-syntax)); the CLI lists in index order, the popup ranks.
 - Live updates and the journal both need an elevated process; the popup gets them from the elevated helper `searchd` (step 3).
 - NTFS only for `mft`; volumes without an active USN journal are skipped (not created).
 - One name per file (hard links show a single name).
@@ -128,7 +128,7 @@ Everything-style, case-insensitive everywhere. Plain words behave as before.
 
 Half-typed input never errors: a broken regex (say a trailing `regex:(`) simply shows no results.
 
-How it stays fast: every term with a literal part (`.png`, `_reaction.gif`, `report`, an `ext:` list, a regex's own prefix or suffix) is scanned for with SIMD `memmem` over the flat name buffer, with the name's terminating NUL included for end-anchored patterns so `*.png` only finds names that end in `.png`; only those candidates are checked in full. Terms with no literal (`???`, `!x`, a bare path substring) have to look at every entry.
+How it stays fast: every term with a literal part (`.png`, `_reaction.gif`, `report`, an `ext:` list, a regex's own prefix or suffix) is scanned for with SIMD `memmem` over the flat name buffer, with the name's terminating NUL included for end-anchored patterns so `*.png` only finds names that end in `.png`; only those candidates are checked in full. `*.png`-style globs and `ext:` use a small per-entry extension hash (2 bytes) instead of scanning names. Path terms are matched per **folder**, not per file: each folder keeps a DFA state for its own path (4 bytes per entry for the folder link, plus a row per folder), so most files are accepted or rejected from their folder's state alone. Terms with no literal (`???`, `!x`) still look at every entry. About 8 extra bytes per entry in RAM; nothing is added to the snapshot, the hints are rebuilt on load.
 
 ### Ranking
 

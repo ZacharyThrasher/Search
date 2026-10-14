@@ -197,17 +197,30 @@ fn main() {
         ("path + glob", r"photo1\*.png"),
         ("path only (substring)", r"photo1\report"),
         ("no literal at all", "???.??"),
+        ("path, nothing alive", r"zzzz\"),
+        ("negated name", "!zzzz"),
         ("broken regex", "regex:("),
     ];
     println!(
         "{:<26} {:<26} {:>12} {:>10} {:>10} {:>10}",
         "case", "query", "matches", "ranked", "count only", "first 50"
     );
+    let runs: usize = std::env::var("RUNS")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(5);
+    let only = std::env::args().nth(2);
     for (label, q) in queries {
+        if only
+            .as_ref()
+            .is_some_and(|o| !q.contains(o.as_str()) && !label.contains(o.as_str()))
+        {
+            continue;
+        }
         let time = |f: &dyn Fn() -> usize| -> (usize, Duration) {
             let mut best = Duration::MAX;
             let mut n = 0;
-            for _ in 0..5 {
+            for _ in 0..runs {
                 let t = Instant::now();
                 n = f();
                 best = best.min(t.elapsed());
