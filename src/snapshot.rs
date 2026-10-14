@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
 
-use crate::index::{Index, OwnedParts};
+use crate::index::{Index, OwnedParts, spare};
 
 const _: () = assert!(cfg!(target_endian = "little"), "snapshots are little-endian");
 
@@ -192,9 +192,19 @@ fn read_exact_into(f: &mut File, buf: &mut [u8]) -> Result<(), LoadError> {
     f.read_exact(buf).map_err(LoadError::Io)
 }
 
+/// Columns are read with a little spare capacity so the first live edits
+/// do not have to reallocate (and copy) hundreds of MB.
 fn read_u32s(f: &mut File, n: usize) -> Result<Vec<u32>, LoadError> {
-    let mut v = vec![0u32; n];
+    let mut v = Vec::with_capacity(n + spare(n));
+    v.resize(n, 0u32);
     read_exact_into(f, u32s_as_bytes_mut(&mut v))?;
+    Ok(v)
+}
+
+fn read_bytes(f: &mut File, n: usize) -> Result<Vec<u8>, LoadError> {
+    let mut v = Vec::with_capacity(n + spare(n));
+    v.resize(n, 0u8);
+    read_exact_into(f, &mut v)?;
     Ok(v)
 }
 
@@ -242,16 +252,13 @@ pub fn load(path: &Path) -> Result<(Meta, Index), LoadError> {
     }
     let (n, lower_len, orig_len) = (n as usize, lower_len as usize, orig_len as usize);
 
-    let mut lower = vec![0u8; lower_len];
-    read_exact_into(&mut f, &mut lower)?;
-    let mut orig = vec![0u8; orig_len];
-    read_exact_into(&mut f, &mut orig)?;
+    let lower = read_bytes(&mut f, lower_len)?;
+    let orig = read_bytes(&mut f, orig_len)?;
     let lower_off = read_u32s(&mut f, n + 1)?;
     let orig_off = read_u32s(&mut f, n + 1)?;
     let parent = read_u32s(&mut f, n)?;
     let rec = read_u32s(&mut f, n)?;
-    let mut flags = vec![0u8; n];
-    read_exact_into(&mut f, &mut flags)?;
+    let flags = read_bytes(&mut f, n)?;
     let mut footer = [0u8; FOOTER_LEN];
     read_exact_into(&mut f, &mut footer)?;
     if &footer[8..16] != END_MAGIC {
