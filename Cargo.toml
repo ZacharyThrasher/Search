@@ -1,0 +1,40 @@
+[package]
+name = "search"
+version = "0.1.0"
+edition = "2024"
+description = "Local filename search for Windows 11: in-RAM NTFS MFT index plus a timing CLI"
+publish = false
+
+[lib]
+name = "search"
+path = "src/lib.rs"
+
+[[bin]]
+name = "s"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+memchr = "2.8"
+rayon = "1.12"
+rustc-hash = "2.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

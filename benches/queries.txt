@@ -1,0 +1,11 @@
+# Sample queries for --bench / --queries-file (one per line)
+a
+the
+notepad
+readme.md
+dll
+.txt
+test config
+report 2024
+node_modules
+zzzzqqq
