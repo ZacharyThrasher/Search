@@ -168,13 +168,34 @@ foreach ($q in @('notepad', 'readme', 'a')) {
     Log "  $q : $($o | Where-Object { $_ -match 'round trip' })"
 }
 
-# shutdown writes the snapshots and the process exits
+# a cold scan leaves a snapshot behind on its own (no shutdown needed)
+$t = [Diagnostics.Stopwatch]::StartNew()
+while ($t.Elapsed.TotalSeconds -lt 30 -and -not (Get-ChildItem $helperSnap -Filter *.snap -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 250 }
+$snapNow = Get-ChildItem $helperSnap -Filter *.snap -ErrorAction SilentlyContinue
+Log ("  snapshot written after the cold scan, before any shutdown: {0} ({1:N1} s after ready)" -f [bool]$snapNow, $t.Elapsed.TotalSeconds)
+if (-not $snapNow) { $failures.Add('no snapshot appeared after the cold scan') }
+$before = ($snapNow | Measure-Object LastWriteTimeUtc -Maximum).Maximum
+Start-Sleep -Seconds 2
+
+# Task Scheduler / Windows stop a program by asking its window to close: that must save and exit
+Add-Type -Namespace W -Name U -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr FindWindow(string c, string t); [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'
+$win = [W.U]::FindWindow('SearchdSessionWatcher', "searchd-$tag")
+Log "  helper session window found: $($win -ne [IntPtr]::Zero)"
+if ($win -eq [IntPtr]::Zero) { $failures.Add('helper has no session window') } else { [void][W.U]::PostMessage($win, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) }   # WM_CLOSE
+$hp.WaitForExit(30000) | Out-Null
+$after = (Get-ChildItem $helperSnap -Filter *.snap -ErrorAction SilentlyContinue | Measure-Object LastWriteTimeUtc -Maximum).Maximum
+Log "  WM_CLOSE: exited=$($hp.HasExited)  snapshot rewritten=$($after -gt $before)"
+if (-not $hp.HasExited) { $failures.Add('helper did not exit on WM_CLOSE'); $hp.Kill() }
+elseif (-not ($after -gt $before)) { $failures.Add('helper did not save on WM_CLOSE') }
+
+# the pipe's Shutdown request does the same
+$hp = Start-Process -FilePath $searchd -ArgumentList (@('--pipe-tag', $tag, '--data-dir', "`"$helperSnap`"") + $hv) -WindowStyle Hidden -PassThru
+$o = Q @('--wait', '60', '--status')
 $o = Q @('--shutdown')
 $hp.WaitForExit(30000) | Out-Null
-Log "  shutdown: exited=$($hp.HasExited)  snapshots in helper dir: $((Get-ChildItem $helperSnap -Filter *.snap -ErrorAction SilentlyContinue | Measure-Object).Count)"
+Log "  Shutdown request: exited=$($hp.HasExited)"
 if (-not $hp.HasExited) { $failures.Add('helper did not exit on shutdown'); $hp.Kill() }
-elseif (-not (Get-ChildItem $helperSnap -Filter *.snap -ErrorAction SilentlyContinue)) { $failures.Add('helper did not save a snapshot on shutdown') }
-Log ("  helper log tail:"); Get-Content (Join-Path $helperSnap 'searchd.log') -Tail 6 -ErrorAction SilentlyContinue | ForEach-Object { Log "    $_" }
+Log ("  helper log tail:"); Get-Content (Join-Path $helperSnap 'searchd.log') -Tail 8 -ErrorAction SilentlyContinue | ForEach-Object { Log "    $_" }
 
 # cleanup
 if (Test-Path $TestDir) { Remove-Item -Recurse -Force $TestDir -ErrorAction SilentlyContinue }

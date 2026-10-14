@@ -134,5 +134,5 @@ theme = "system"         # or "dark" / "light"
 - **Any process running as you can read the index** through the pipe, including names inside folders your account cannot list (the helper reads the MFT as admin). It sees names only, never contents, and cannot make the helper run anything.
 - The pipe name is predictable. If another account on the same PC created `\\.\pipe\SearchHelper-<your SID>` before the helper did, the popup would talk to it. Not defended on this single-user PC; the fix would be to check the server's exe path before trusting a reply.
 - The helper keeps the whole index in RAM (about 51 B per entry, so roughly 800 MB for 15.7 M files).
-- The helper saves snapshots hourly when worth it (see the snapshot rules above) and on a clean `Shutdown`. A logoff or crash loses nothing: the next start replays the USN journal.
+- The helper writes a snapshot right after any scan (first run, or when the old one was no use), then hourly when worth it (see the snapshot rules above), and on exit: the pipe's `Shutdown`, Windows logoff/shutdown (`WM_ENDSESSION`), or a close request from Task Scheduler (`WM_CLOSE`). A hard kill or crash loses nothing: the next start replays the USN journal.
 - `searchd --walk DIR` indexes a folder without elevation (static; handy for trying the popup); `searchd --console` echoes the log to the terminal it was started from.
