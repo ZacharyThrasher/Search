@@ -98,6 +98,22 @@ pub struct Index {
     by_rec: Vec<u32>,
     orphans: usize,
     dead: usize,
+    /// Set once the index is built: later appends grow the columns by a few
+    /// percent instead of doubling, so a live index never holds (or copies)
+    /// twice the memory it needs.
+    live_growth: bool,
+}
+
+/// Spare room kept in every column of a finished index (2%, at least 4096).
+pub fn spare(len: usize) -> usize {
+    len / 50 + 4096
+}
+
+/// Make room for `need` more items without the doubling `Vec` would do.
+fn make_room<T>(v: &mut Vec<T>, need: usize, live: bool) {
+    if live && v.capacity() - v.len() < need {
+        v.reserve_exact(need + spare(v.len()));
+    }
 }
 
 /// Collects entries for one volume, then resolves parents and hands back an
@@ -172,13 +188,14 @@ impl Builder {
     pub fn build(mut self) -> Index {
         self.end_volume();
         let ix = &mut self.ix;
-        ix.lower.shrink_to_fit();
-        ix.orig.shrink_to_fit();
-        ix.lower_off.shrink_to_fit();
-        ix.orig_off.shrink_to_fit();
-        ix.parent.shrink_to_fit();
-        ix.rec.shrink_to_fit();
-        ix.flags.shrink_to_fit();
+        ix.lower.shrink_to(ix.lower.len() + spare(ix.lower.len()));
+        ix.orig.shrink_to(ix.orig.len() + spare(ix.orig.len()));
+        ix.lower_off.shrink_to(ix.lower_off.len() + spare(ix.lower_off.len()));
+        ix.orig_off.shrink_to(ix.orig_off.len() + spare(ix.orig_off.len()));
+        ix.parent.shrink_to(ix.parent.len() + spare(ix.parent.len()));
+        ix.rec.shrink_to(ix.rec.len() + spare(ix.rec.len()));
+        ix.flags.shrink_to(ix.flags.len() + spare(ix.flags.len()));
+        ix.live_growth = true;
         self.ix
     }
 }
@@ -196,6 +213,7 @@ impl Index {
             by_rec: Vec::new(),
             orphans: 0,
             dead: 0,
+            live_growth: false,
         }
     }
 
@@ -208,6 +226,14 @@ impl Index {
         {
             return None;
         }
+        let live = self.live_growth;
+        make_room(&mut self.lower, name.len() * 3 + 2, live);
+        make_room(&mut self.orig, name.len() + 1, live);
+        make_room(&mut self.lower_off, 1, live);
+        make_room(&mut self.orig_off, 1, live);
+        make_room(&mut self.parent, 1, live);
+        make_room(&mut self.rec, 1, live);
+        make_room(&mut self.flags, 1, live);
         fold_into(name, &mut self.lower);
         self.lower.push(0);
         self.orig.extend_from_slice(name.as_bytes());
@@ -225,6 +251,7 @@ impl Index {
     fn rebuild_lookup(&mut self) {
         let max = self.rec.iter().copied().max().map_or(0, |m| m as usize + 1);
         self.by_rec.clear();
+        self.by_rec.reserve_exact(max + spare(max));
         self.by_rec.resize(max, NONE);
         for i in 0..self.rec.len() {
             if self.flags[i] & FLAG_DEAD != 0 {
@@ -323,6 +350,8 @@ impl Index {
             return Applied::Skipped;
         };
         if rec as usize >= self.by_rec.len() {
+            let need = rec as usize + 1 - self.by_rec.len();
+            make_room(&mut self.by_rec, need, self.live_growth);
             self.by_rec.resize(rec as usize + 1, NONE);
         }
         self.by_rec[rec as usize] = i;
@@ -396,8 +425,9 @@ impl Index {
             out.by_rec[r as usize] = i as u32;
         }
         out.orphans = self.orphans;
-        out.lower.shrink_to_fit();
-        out.orig.shrink_to_fit();
+        out.live_growth = true;
+        out.lower.shrink_to(out.lower.len() + spare(out.lower.len()));
+        out.orig.shrink_to(out.orig.len() + spare(out.orig.len()));
         out
     }
 
@@ -456,6 +486,7 @@ impl Index {
             by_rec: Vec::new(),
             orphans: p.orphans,
             dead,
+            live_growth: true,
         };
         ix.rebuild_lookup();
         if ix.dead != dead {
@@ -968,6 +999,29 @@ mod tests {
         assert!(!ix.remove(20));
         assert!(paths(&ix, "taxes").is_empty());
         assert_eq!(ix.find_record(20), None);
+    }
+
+    #[test]
+    fn live_edits_do_not_double_memory() {
+        let mut b = Builder::new();
+        b.begin_volume("G:", 5);
+        for i in 0..200_000u64 {
+            b.push(100 + i, 5, &format!("some-file-{i:x}.dat"), false);
+        }
+        let mut ix = b.build();
+        let before = ix.heap_bytes();
+        // Plenty of churn: new names, renames (which append), deletes.
+        for i in 0..2_000u64 {
+            ix.upsert(300_000 + i, 5, &format!("brand-new-{i}.txt"), false);
+            ix.upsert(100 + i, 5, &format!("renamed-{i}.dat"), false);
+            ix.remove(10_000 + i);
+        }
+        let after = ix.heap_bytes();
+        assert!(after < before + before / 10, "grew from {before} to {after}");
+        assert_eq!(ix.search("brand-new-1999", QueryOpts::default()).total, 1);
+        // A round trip through compaction also keeps the headroom small.
+        let c = ix.compacted();
+        assert!(c.heap_bytes() < before + before / 10);
     }
 
     #[test]
