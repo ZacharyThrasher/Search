@@ -1,0 +1,12 @@
+{"n": 100000, "dtype": "f16", "build_s": 37.8, "build_vec_per_s": 2648, "mem_mb": 152.0, "ms_p50": 0.596, "ms_p95": 0.879, "recall10": 0.9977}
+{"n": 100000, "dtype": "i8", "build_s": 20.5, "build_vec_per_s": 4882, "mem_mb": 84.9, "ms_p50": 0.356, "ms_p95": 0.492, "recall10": 0.8744}
+{"n": 500000, "dtype": "f16", "build_s": 214.6, "build_vec_per_s": 2330, "mem_mb": 658.5, "ms_p50": 0.747, "ms_p95": 1.428, "recall10": 0.407}
+{"n": 500000, "dtype": "i8", "build_s": 123.6, "build_vec_per_s": 4044, "mem_mb": 390.1, "ms_p50": 0.372, "ms_p95": 2.389, "recall10": 0.3907}
+{"n": 1000000, "dtype": "f16", "build_s": 510.6, "build_vec_per_s": 1958, "mem_mb": 1333.8, "ms_p50": 0.687, "ms_p95": 1.115, "recall10": 0.3163}
+{"n": 1000000, "dtype": "i8", "build_s": 270.8, "build_vec_per_s": 3693, "mem_mb": 796.9, "ms_p50": 0.424, "ms_p95": 0.752, "recall10": 0.3116}
+{"n": 500000, "build_s": 153.5, "mem_mb": 659}
+{"n": 500000, "ef": 32, "ms_p50": 0.57, "exact_recall": 0.235, "near_recall": 0.453}
+{"n": 500000, "ef": 64, "ms_p50": 0.579, "exact_recall": 0.333, "near_recall": 0.623}
+{"n": 500000, "ef": 128, "ms_p50": 0.888, "exact_recall": 0.416, "near_recall": 0.723}
+{"n": 500000, "ef": 256, "ms_p50": 1.553, "exact_recall": 0.498, "near_recall": 0.851}
+{"n": 500000, "ef": 512, "ms_p50": 2.669, "exact_recall": 0.621, "near_recall": 0.953}

@@ -1,0 +1,15 @@
+[package]
+name = "ort-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "ndarray", "api-24", "download-binaries", "copy-dylibs", "tls-native"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3

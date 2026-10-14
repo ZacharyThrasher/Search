@@ -1,0 +1,7 @@
+{"model": "gte-small", "variant": "model", "size_mb": 133.1, "chunks_per_s_t4": 10.0, "tok_per_chunk": 335.1, "query_ms_p50_t4": 10.7, "query_ms_p95_t4": 16.2, "rss_mb_after": 717.0, "dim": 384, "chunks_per_s_t1": 2.8, "query_ms_p50_t1": 21.0}
+{"model": "gte-small", "variant": "model_int8", "size_mb": 33.8, "chunks_per_s_t4": 14.9, "tok_per_chunk": 335.1, "query_ms_p50_t4": 7.9, "query_ms_p95_t4": 11.5, "rss_mb_after": 851.0, "dim": 384, "chunks_per_s_t1": 4.5, "query_ms_p50_t1": 10.8}
+{"model": "arctic-s", "variant": "model", "size_mb": 133.1, "chunks_per_s_t4": 9.9, "tok_per_chunk": 335.1, "query_ms_p50_t4": 15.1, "query_ms_p95_t4": 23.4, "rss_mb_after": 717.0, "dim": 384, "chunks_per_s_t1": 2.9, "query_ms_p50_t1": 27.2}
+{"model": "arctic-s", "variant": "model_int8", "size_mb": 34.0, "chunks_per_s_t4": 15.0, "tok_per_chunk": 335.1, "query_ms_p50_t4": 11.0, "query_ms_p95_t4": 16.1, "rss_mb_after": 626.0, "dim": 384, "chunks_per_s_t1": 4.7, "query_ms_p50_t1": 12.7}
+{"model": "e5-small", "variant": "model_int8", "size_mb": 33.8, "chunks_per_s_t4": 15.4, "tok_per_chunk": 336.2, "query_ms_p50_t4": 7.5, "query_ms_p95_t4": 10.6, "rss_mb_after": 850.0, "dim": 384, "chunks_per_s_t1": 4.6, "query_ms_p50_t1": 13.4}
+{"model": "bge-small", "variant": "model", "size_mb": 133.1, "chunks_per_s_t4": 9.7, "tok_per_chunk": 335.1, "query_ms_p50_t4": 12.8, "query_ms_p95_t4": 17.0, "rss_mb_after": 718.0, "dim": 384, "chunks_per_s_t1": 3.0, "query_ms_p50_t1": 24.3}
+RERUNDONE

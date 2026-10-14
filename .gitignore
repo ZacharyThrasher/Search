@@ -3,3 +3,5 @@
 /bench-results/
 /runner-results/
 /.runner/
+bench-embed/*/target/
+bench-embed/__pycache__/
