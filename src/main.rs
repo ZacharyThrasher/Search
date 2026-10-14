@@ -1,15 +1,20 @@
-//! `s` – timing CLI for the in-RAM filename index.
+//! `s` – filename search CLI over the live in-RAM index.
 //!
-//! Builds the index (MFT by default), reports how long that took and how much
-//! memory it uses, then answers queries and reports per-query latency.
+//! Loads the saved snapshot (or scans the MFT when there is none), replays
+//! the USN journal to catch up, then answers queries and reports timings. In
+//! interactive mode it keeps tailing the journal, so files you create, rename
+//! or delete show up in the next query.
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use search::index::{Builder, Index, Kind, QueryOpts};
+use search::fmt::{age, commas, dur, mib};
+use search::index::{Builder, Kind, QueryOpts};
+use search::live::{Config, Engine, FailureKind, Hit, SavePolicy};
 use search::sys;
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -24,7 +29,7 @@ enum Source {
 #[command(
     name = "s",
     version,
-    about = "Instant filename search: in-RAM index with timings"
+    about = "Instant filename search: live in-RAM index with timings"
 )]
 struct Cli {
     /// Search terms (all must appear in the file name). Omit for interactive mode.
@@ -72,6 +77,31 @@ struct Cli {
     /// Threads reading the MFT per volume (1 = serial, 0 = default of 8).
     #[arg(long, value_name = "N", default_value_t = 0)]
     mft_threads: usize,
+
+    /// Where snapshots are kept (default: %LOCALAPPDATA%\Search).
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
+
+    /// Neither read nor write snapshots: scan the MFT every run (step-1 behavior).
+    #[arg(long)]
+    no_snapshot: bool,
+
+    /// Ignore the saved snapshot and rescan, then save the fresh result.
+    #[arg(long, conflicts_with = "no_snapshot")]
+    rescan: bool,
+
+    /// Write snapshots on exit even if little changed.
+    #[arg(long, conflicts_with = "no_snapshot")]
+    save: bool,
+
+    /// Do not tail the USN journal in interactive mode (catch up once, then freeze).
+    #[arg(long)]
+    no_live: bool,
+
+    /// Create, rename and delete files under DIR and time how fast the live
+    /// index reflects each change. Exits non-zero if any takes over 1 s.
+    #[arg(long, value_name = "DIR")]
+    live_test: Option<PathBuf>,
 }
 
 /// Measured on a 32-thread Ryzen: C: (14.8M records) reads in 14.6 s at 8
@@ -79,121 +109,114 @@ struct Cli {
 #[cfg(windows)]
 const DEFAULT_MFT_THREADS: usize = 8;
 
-fn fmt_dur(d: Duration) -> String {
-    let us = d.as_secs_f64() * 1e6;
-    if us < 1000.0 {
-        format!("{us:.0} µs")
-    } else if us < 1e6 {
-        format!("{:.2} ms", us / 1e3)
-    } else {
-        format!("{:.2} s", us / 1e6)
-    }
-}
-
-fn mib(bytes: usize) -> String {
-    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-}
-
-fn commas(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 fn parse_letter(s: &str) -> Option<char> {
     let c = s.trim().chars().next()?;
     c.is_ascii_alphabetic().then(|| c.to_ascii_uppercase())
 }
 
+/// Drive letter of an absolute path such as `C:\Users\x`.
+fn drive_of(path: &Path) -> Option<char> {
+    use std::path::{Component, Prefix};
+    let abs = std::path::absolute(path).ok()?;
+    match abs.components().next()? {
+        Component::Prefix(p) => match p.kind() {
+            Prefix::Disk(b) | Prefix::VerbatimDisk(b) => Some((b as char).to_ascii_uppercase()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn default_data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("Search"))
+        .unwrap_or_else(|| std::env::temp_dir().join("Search"))
+}
+
 #[cfg(windows)]
-fn build_mft(cli: &Cli, builder: &mut Builder) -> Result<usize, String> {
-    use search::mft;
-    let letters: Vec<char> = if cli.volumes.is_empty() {
-        mft::fixed_ntfs_volumes()
-    } else {
+fn mft_sources(cli: &Cli) -> Result<Vec<Arc<dyn search::live::Source>>, String> {
+    use search::mft::{self, NtfsSource};
+    let mut letters: Vec<char> = if !cli.volumes.is_empty() {
         cli.volumes
             .iter()
             .map(|v| parse_letter(v).ok_or_else(|| format!("bad drive letter: {v}")))
             .collect::<Result<_, _>>()?
+    } else if let Some(dir) = &cli.live_test {
+        vec![drive_of(dir).ok_or_else(|| format!("no drive letter in {}", dir.display()))?]
+    } else {
+        mft::fixed_ntfs_volumes()
     };
+    letters.sort_unstable();
+    letters.dedup();
     if letters.is_empty() {
         return Err("no fixed NTFS volumes found".into());
     }
-    let mut denied = false;
-    let mut done = 0;
-    for letter in letters {
-        let threads = if cli.mft_threads == 0 {
-            DEFAULT_MFT_THREADS.min(rayon::current_num_threads())
-        } else {
-            cli.mft_threads
-        };
-        match mft::index_volume(letter, builder, threads) {
-            Ok(s) => {
-                done += 1;
-                eprintln!(
-                    "  {}: {:>12} entries ({} MFT records est.)  read {} (summed ioctl {})  merge {}  resolve {}  {} calls, {}",
-                    s.letter,
-                    commas(s.entries),
-                    commas(s.mft_records_estimate as usize),
-                    fmt_dur(s.enumerate),
-                    fmt_dur(s.ioctl),
-                    fmt_dur(s.parse),
-                    fmt_dur(s.resolve),
-                    s.ioctl_calls,
-                    mib(s.bytes as usize),
-                );
-                if s.orphans > 0 {
-                    eprintln!(
-                        "     note: {} entries had an unknown parent",
-                        commas(s.orphans)
-                    );
-                }
-            }
-            Err(e) => {
-                let code = e.raw_os_error();
-                if code == Some(mft::ERROR_ACCESS_DENIED) {
-                    denied = true;
-                    eprintln!("  {letter}: access denied");
-                } else if code == Some(mft::ERROR_JOURNAL_NOT_ACTIVE) {
-                    eprintln!("  {letter}: USN journal is not active on this volume (skipped)");
-                } else {
-                    eprintln!("  {letter}: {e}");
-                }
-            }
-        }
-    }
-    if denied {
-        eprintln!(
-            "\nRaw volume access needs an elevated shell. Re-run from an Administrator\n\
-             terminal, or index folders without elevation: s --source walk --root C:\\Users"
-        );
-    }
-    Ok(done)
+    let threads = if cli.mft_threads == 0 {
+        DEFAULT_MFT_THREADS.min(rayon::current_num_threads())
+    } else {
+        cli.mft_threads
+    };
+    Ok(letters
+        .into_iter()
+        .map(|l| Arc::new(NtfsSource::new(l, threads)) as Arc<dyn search::live::Source>)
+        .collect())
 }
 
 #[cfg(not(windows))]
-fn build_mft(_: &Cli, _: &mut Builder) -> Result<usize, String> {
+fn mft_sources(_: &Cli) -> Result<Vec<Arc<dyn search::live::Source>>, String> {
     Err("--source mft is only available on Windows".into())
 }
 
-fn build(cli: &Cli) -> Result<Index, String> {
-    let mut builder = Builder::new();
+fn config(cli: &Cli, tail: bool) -> Config {
+    Config {
+        data_dir: (!cli.no_snapshot).then(|| cli.data_dir.clone().unwrap_or_else(default_data_dir)),
+        tail,
+        force_rescan: cli.rescan,
+        log: Arc::new(|line| eprintln!("{line}")),
+        ..Default::default()
+    }
+}
+
+fn build(cli: &Cli, tail: bool) -> Result<Engine, String> {
     let t = Instant::now();
-    let volumes = match cli.source {
-        Source::Mft => build_mft(cli, &mut builder)?,
+    let engine = match cli.source {
+        Source::Mft => {
+            let sources = mft_sources(cli)?;
+            let cfg = config(cli, tail);
+            if let Some(d) = &cfg.data_dir {
+                eprintln!("snapshots: {}", d.display());
+            }
+            let engine = Engine::start(sources, cfg);
+            let mut denied = false;
+            for f in &engine.failures {
+                match f.kind {
+                    FailureKind::AccessDenied => {
+                        denied = true;
+                        eprintln!("  {} access denied", f.label);
+                    }
+                    FailureKind::NoJournal => eprintln!(
+                        "  {} USN journal is not active on this volume (skipped; it is never created)",
+                        f.label
+                    ),
+                    FailureKind::Other => eprintln!("  {} {}", f.label, f.message),
+                }
+            }
+            if denied {
+                eprintln!(
+                    "\nRaw volume access needs an elevated shell. Re-run from an Administrator\n\
+                     terminal, or index folders without elevation: s --source walk --root C:\\Users"
+                );
+            }
+            engine
+        }
         Source::Walk => {
             if cli.root.is_empty() {
                 return Err("--source walk needs at least one --root PATH".into());
             }
-            let mut n = 0;
+            let mut indexes = Vec::new();
             for root in &cli.root {
-                let s = search::walk::index_tree(root, &mut builder)
+                let mut b = Builder::new();
+                let s = search::walk::index_tree(root, &mut b)
                     .map_err(|e| format!("{}: {e}", root.display()))?;
                 eprintln!(
                     "  {}: {:>12} entries ({} unreadable)",
@@ -201,32 +224,30 @@ fn build(cli: &Cli) -> Result<Index, String> {
                     commas(s.entries),
                     s.errors
                 );
-                n += 1;
+                let ix = b.build();
+                indexes.push((ix.path(0).trim_end_matches('\\').to_string(), ix));
             }
-            n
+            Engine::from_indexes(indexes)
         }
     };
-    if volumes == 0 {
+    if engine.volumes().is_empty() {
         return Err("nothing was indexed".into());
     }
-    let tb = Instant::now();
-    let ix = builder.build();
-    let finish = tb.elapsed();
     let total = t.elapsed();
     eprintln!(
-        "indexed {} entries in {} (final compaction {})",
-        commas(ix.len()),
-        fmt_dur(total),
-        fmt_dur(finish)
+        "ready: {} entries in {}",
+        commas(engine.len()),
+        dur(total)
     );
-    let per_entry = if ix.is_empty() {
+    let n = engine.len();
+    let per_entry = if n == 0 {
         0.0
     } else {
-        ix.heap_bytes() as f64 / ix.len() as f64
+        engine.heap_bytes() as f64 / n as f64
     };
     eprint!(
         "index memory: {} ({per_entry:.0} B/entry)",
-        mib(ix.heap_bytes())
+        mib(engine.heap_bytes())
     );
     if let Some(m) = sys::process_memory() {
         eprint!(
@@ -236,7 +257,7 @@ fn build(cli: &Cli) -> Result<Index, String> {
         );
     }
     eprintln!();
-    Ok(ix)
+    Ok(engine)
 }
 
 fn kind_of(cli: &Cli) -> Kind {
@@ -247,16 +268,11 @@ fn kind_of(cli: &Cli) -> Kind {
     }
 }
 
-fn print_hits(ix: &Index, hits: &[u32], total: usize, exact: bool) {
+fn print_hits(hits: &[Hit], total: usize, exact: bool) {
     let out = io::stdout();
     let mut out = out.lock();
-    for &h in hits {
-        let _ = writeln!(
-            out,
-            "{}{}",
-            ix.path(h),
-            if ix.is_dir(h) { "\\" } else { "" }
-        );
+    for h in hits {
+        let _ = writeln!(out, "{}{}", h.path, if h.is_dir { "\\" } else { "" });
     }
     if total > hits.len() {
         let _ = writeln!(
@@ -268,26 +284,23 @@ fn print_hits(ix: &Index, hits: &[u32], total: usize, exact: bool) {
     }
 }
 
-fn run_once(ix: &Index, cli: &Cli, q: &str) {
+fn run_once(engine: &Engine, cli: &Cli, q: &str) {
     let opts = QueryOpts {
         limit: cli.limit,
         count_total: !cli.no_count,
         kind: kind_of(cli),
     };
     let t = Instant::now();
-    let r = ix.search(q, opts);
+    let r = engine.search(q, opts);
     let search_t = t.elapsed();
-    let t = Instant::now();
     if !cli.quiet {
-        print_hits(ix, &r.hits, r.total, opts.count_total);
+        print_hits(&r.hits, r.total, opts.count_total);
     }
-    let paths_t = t.elapsed();
     eprintln!(
-        "\"{q}\": {} results in {} (paths for {} shown: {})",
+        "\"{q}\": {} results in {} (incl. paths for {} shown)",
         commas(r.total),
-        fmt_dur(search_t),
+        dur(search_t),
         r.hits.len(),
-        fmt_dur(paths_t)
     );
 }
 
@@ -296,15 +309,15 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[i]
 }
 
-fn bench_variant(ix: &Index, q: &str, base: QueryOpts, runs: usize) -> (usize, [Duration; 3]) {
+fn bench_variant(engine: &Engine, q: &str, base: QueryOpts, runs: usize) -> (usize, [Duration; 3]) {
     for _ in 0..5 {
-        std::hint::black_box(ix.search(q, base));
+        std::hint::black_box(engine.search(q, base));
     }
     let mut times = Vec::with_capacity(runs);
     let mut total = 0;
     for _ in 0..runs {
         let t = Instant::now();
-        let r = ix.search(q, base);
+        let r = engine.search(q, base);
         times.push(t.elapsed());
         total = r.total;
         std::hint::black_box(&r);
@@ -320,10 +333,10 @@ fn bench_variant(ix: &Index, q: &str, base: QueryOpts, runs: usize) -> (usize, [
     )
 }
 
-fn run_bench(ix: &Index, cli: &Cli, q: &str, runs: usize) {
+fn run_bench(engine: &Engine, cli: &Cli, q: &str, runs: usize) {
     let kind = kind_of(cli);
     let (total, full) = bench_variant(
-        ix,
+        engine,
         q,
         QueryOpts {
             limit: cli.limit,
@@ -333,7 +346,7 @@ fn run_bench(ix: &Index, cli: &Cli, q: &str, runs: usize) {
         runs,
     );
     let (_, page) = bench_variant(
-        ix,
+        engine,
         q,
         QueryOpts {
             limit: cli.limit,
@@ -346,33 +359,39 @@ fn run_bench(ix: &Index, cli: &Cli, q: &str, runs: usize) {
         "{:<28} {:>11} hits | full count p50 {:>9} p95 {:>9} max {:>9} | first page p50 {:>9} p95 {:>9}",
         format!("\"{q}\""),
         commas(total),
-        fmt_dur(full[0]),
-        fmt_dur(full[1]),
-        fmt_dur(full[2]),
-        fmt_dur(page[0]),
-        fmt_dur(page[1]),
+        dur(full[0]),
+        dur(full[1]),
+        dur(full[2]),
+        dur(page[0]),
+        dur(page[1]),
     );
+}
+
+fn print_stats(engine: &Engine) {
+    for v in engine.volumes() {
+        eprintln!(
+            "  {}: {} entries ({} dead), {}, {}, {} journal records applied{}",
+            v.label,
+            commas(v.entries),
+            commas(v.dead),
+            mib(v.heap_bytes),
+            if v.stale {
+                "STALE (snapshot only)"
+            } else if v.live {
+                "live"
+            } else {
+                "static"
+            },
+            commas(v.applied as usize),
+            v.snapshot_age
+                .map(|a| format!(", snapshot {} old", age(a)))
+                .unwrap_or_default()
+        );
+    }
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    eprintln!(
-        "source: {}   elevated: {}   threads: {}",
-        if cli.source == Source::Mft {
-            "NTFS MFT (FSCTL_ENUM_USN_DATA)"
-        } else {
-            "directory walk"
-        },
-        if sys::is_elevated() { "yes" } else { "no" },
-        rayon::current_num_threads()
-    );
-    let ix = match build(&cli) {
-        Ok(ix) => ix,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(1);
-        }
-    };
 
     let mut queries: Vec<String> = Vec::new();
     if !cli.query.is_empty() {
@@ -392,9 +411,50 @@ fn main() -> ExitCode {
             }
         }
     }
+    let interactive = queries.is_empty() && cli.live_test.is_none();
+    let tail = (interactive && !cli.no_live) || cli.live_test.is_some();
+    if cli.live_test.is_some() && cli.source != Source::Mft {
+        eprintln!("error: --live-test needs --source mft");
+        return ExitCode::from(1);
+    }
 
-    if queries.is_empty() {
-        eprintln!("\ninteractive mode: type a query, empty line or :q to quit");
+    eprintln!(
+        "source: {}   elevated: {}   threads: {}",
+        if cli.source == Source::Mft {
+            "NTFS MFT + USN journal"
+        } else {
+            "directory walk"
+        },
+        if sys::is_elevated() { "yes" } else { "no" },
+        rayon::current_num_threads()
+    );
+    let mut engine = match build(&cli, tail) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut code = ExitCode::SUCCESS;
+    if let Some(dir) = &cli.live_test {
+        eprintln!("\nlive test in {} (budget {} per change):", dir.display(), dur(search::selftest::BUDGET));
+        match search::selftest::run(&engine, dir, &|l| eprintln!("{l}")) {
+            Ok(true) => eprintln!("PASS"),
+            Ok(false) => {
+                eprintln!("FAIL");
+                code = ExitCode::from(2);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                code = ExitCode::from(1);
+            }
+        }
+    } else if interactive {
+        eprintln!(
+            "\ninteractive mode: type a query, :stats for index state, empty line or :q to quit{}",
+            if tail { "" } else { " (live updates off)" }
+        );
         let stdin = io::stdin();
         loop {
             eprint!("> ");
@@ -407,16 +467,25 @@ fn main() -> ExitCode {
             if line.is_empty() || line == ":q" {
                 break;
             }
-            run_once(&ix, &cli, line);
+            if line == ":stats" {
+                print_stats(&engine);
+                continue;
+            }
+            run_once(&engine, &cli, line);
         }
-        return ExitCode::SUCCESS;
+    } else {
+        for q in &queries {
+            match cli.bench {
+                Some(n) => run_bench(&engine, &cli, q, n.max(1)),
+                None => run_once(&engine, &cli, q),
+            }
+        }
     }
 
-    for q in &queries {
-        match cli.bench {
-            Some(n) => run_bench(&ix, &cli, q, n.max(1)),
-            None => run_once(&ix, &cli, q),
-        }
-    }
-    ExitCode::SUCCESS
+    engine.stop();
+    engine.save(SavePolicy {
+        force: cli.save,
+        ..Default::default()
+    });
+    code
 }
