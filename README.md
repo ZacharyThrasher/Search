@@ -126,7 +126,7 @@ Everything-style, case-insensitive everywhere. Plain words behave as before.
 | `regex:^img_\d+\.jpe?g$` | a regular expression on the name (the rest of the word; `\|` inside it is the regex's own) |
 | `"my file"` | quotes keep spaces (and `\|`) literal inside one term |
 
-Half-typed input never errors: a broken regex (say a trailing `regex:(`) simply shows no results.
+Half-typed input never errors: a broken regex (say a trailing `regex:(`) simply shows no results. Limits (the helper that runs queries is elevated): 32 terms, at most 4 `regex:` terms and 4 path terms per query (more shows no results), and compiled regexes and path automata are size-capped.
 
 How it stays fast: every term with a literal part (`.png`, `_reaction.gif`, `report`, an `ext:` list, a regex's own prefix or suffix) is scanned for with SIMD `memmem` over the flat name buffer, with the name's terminating NUL included for end-anchored patterns so `*.png` only finds names that end in `.png`; only those candidates are checked in full. `*.png`-style globs and `ext:` use a small per-entry extension hash (2 bytes) instead of scanning names. Path terms are matched per **folder**, not per file: each folder keeps a DFA state for its own path (4 bytes per entry for the folder link, plus a row per folder), so most files are accepted or rejected from their folder's state alone. Terms with no literal (`???`, `!x`) still look at every entry. About 8 extra bytes per entry in RAM; nothing is added to the snapshot, the hints are rebuilt on load.
 

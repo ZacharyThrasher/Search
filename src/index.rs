@@ -485,8 +485,10 @@ impl Index {
         self.dead >= 50_000 && self.dead * 20 > self.len()
     }
 
-    /// A copy without the dead entries, in the same order.
-    pub fn compacted(&self) -> Index {
+    /// A copy without the dead entries, in the same order, with the columns
+    /// only (no hints): enough to write a snapshot, which is all that is
+    /// rebuilt on load anyway.
+    pub fn compacted_columns(&self) -> Index {
         let live = self.len() - self.dead;
         let mut out = Index::empty();
         out.lower.reserve(self.lower.len());
@@ -522,6 +524,12 @@ impl Index {
         }
         out.orphans = self.orphans;
         out.live_growth = true;
+        out
+    }
+
+    /// A copy without the dead entries, in the same order, ready to serve queries.
+    pub fn compacted(&self) -> Index {
+        let mut out = self.compacted_columns();
         out.build_hints();
         out.lower.shrink_to(out.lower.len() + spare(out.lower.len()));
         out.orig.shrink_to(out.orig.len() + spare(out.orig.len()));
@@ -2245,6 +2253,52 @@ mod tests {
             orphans: 0,
         };
         assert!(Index::from_parts(bad).is_err());
+    }
+
+    /// Randomly assembled queries (operators, half-typed regexes, odd letters)
+    /// against a tree of awkward names: the scan, with all its shortcuts, must
+    /// agree with testing each full path, and never panic.
+    #[test]
+    fn random_queries_agree_with_a_brute_force_check_on_odd_names() {
+        let mut x = 0xC0FF_EE15_600D_F00Du64;
+        let mut rnd = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        let stems = ["a", "ab", "Ab.png", "\u{130}stanbul", "stra\u{df}e", "\u{391}\u{3A3}", "x.tar.gz", "e\u{301}", "\u{1F600}", "img_01.gif", "Report", "cat"];
+        let mut b = Builder::new();
+        b.begin_volume("T:", 5);
+        for d in 0..12u64 {
+            let parent = if d < 2 { 5 } else { 100 + rnd(d as usize) as u64 };
+            b.push(100 + d, parent, &format!("{}{}", stems[rnd(stems.len())], d), true);
+        }
+        for i in 0..400u64 {
+            let name = format!("{}{}", stems[rnd(stems.len())], if rnd(2) == 0 { ".png" } else { "" });
+            b.push(1000 + i, 100 + rnd(12) as u64, &name, false);
+        }
+        b.end_volume();
+        let ix = b.build();
+        let atoms = [
+            "*", "?", "|", "!", " ", "\\", "a", "ab", "b", ".png", "ext:png", "ext:gz", "regex:", "regex:^a", "regex:img_\\d+",
+            "regex:(", "stra", "\u{df}", "\u{3b1}", "\u{3C3}", "\u{e9}", "cat", "report", "t:\\", "x", ".",
+        ];
+        for _ in 0..1500 {
+            let q: String = (0..1 + rnd(7)).map(|_| atoms[rnd(atoms.len())]).collect();
+            let parsed = Query::parse(&q);
+            let got = ix.search_query(&parsed, QueryOpts { limit: usize::MAX, ..Default::default() });
+            let got: Vec<u32> = got.hits.into_iter().filter(|&e| e != 0).collect();
+            let want: Vec<u32> = if parsed.is_invalid() {
+                Vec::new()
+            } else {
+                (1..ix.len() as u32)
+                    .filter(|&e| ix.flags[e as usize] & FLAG_DEAD == 0 && parsed.matches_path(&ix.path(e)))
+                    .collect()
+            };
+            assert_eq!(got, want, "query {q:?}");
+            let _ = ix.search_ranked(&q, Kind::Any, 7);
+        }
     }
 
     /// A random tree searched with every kind of term must agree with testing

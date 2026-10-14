@@ -56,8 +56,8 @@ impl PathMatcher {
                     .match_kind(MatchKind::All)
                     .minimize(false)
                     .accelerate(false)
-                    .dfa_size_limit(Some(8 << 20))
-                    .determinize_size_limit(Some(8 << 20)),
+                    .dfa_size_limit(Some(2 << 20))
+                    .determinize_size_limit(Some(2 << 20)),
             )
             .syntax(syntax::Config::new().unicode(true).utf8(true))
             .build(&re)

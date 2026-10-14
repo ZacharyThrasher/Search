@@ -147,7 +147,7 @@ fn le64(h: &[u8], at: usize) -> u64 {
 pub fn save(path: &Path, meta: &Meta, ix: &Index) -> io::Result<u64> {
     let squeezed;
     let ix = if ix.dead_len() > 0 {
-        squeezed = ix.compacted();
+        squeezed = ix.compacted_columns();
         &squeezed
     } else {
         ix

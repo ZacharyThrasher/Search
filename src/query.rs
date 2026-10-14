@@ -31,6 +31,11 @@ use crate::index::fold_into;
 
 /// Terms beyond this many are ignored.
 const MAX_TERMS: usize = 32;
+/// More regex or path terms than this make the query match nothing: each one
+/// compiles an automaton (and a regex keeps a cache per scan thread), and the
+/// helper that evaluates them is elevated.
+const MAX_REGEX_TERMS: usize = 4;
+const MAX_PATH_TERMS: usize = 4;
 /// Compiled-regex size caps: the helper is elevated and the pattern is typed
 /// by whoever can reach the pipe.
 const REGEX_SIZE_LIMIT: usize = 2 << 20;
@@ -334,14 +339,16 @@ fn regex_literals(pattern: &str) -> Option<Vec<Vec<u8>>> {
         if lits.is_empty() || lits.len() > 16 {
             continue;
         }
-        let folded: Vec<Vec<u8>> = lits
+        // A literal cut mid-character (over-long ones are truncated) cannot be
+        // looked up; skip this kind. Fold the way the index folds names (a
+        // whole-string `to_lowercase` would turn a final capital sigma into 'ς').
+        let Some(folded) = lits
             .iter()
-            .map(|l| {
-                String::from_utf8_lossy(l.as_bytes())
-                    .to_lowercase()
-                    .into_bytes()
-            })
-            .collect();
+            .map(|l| std::str::from_utf8(l.as_bytes()).ok().map(fold))
+            .collect::<Option<Vec<Vec<u8>>>>()
+        else {
+            continue;
+        };
         let min = folded.iter().map(Vec::len).min().unwrap_or(0);
         let better = best
             .as_ref()
@@ -580,8 +587,15 @@ fn tokenize(text: &str) -> Vec<Tok> {
     toks
 }
 
+/// How many regex and path terms the query has used so far.
+#[derive(Default)]
+struct Budget {
+    regex: usize,
+    path: usize,
+}
+
 /// A term built from one word; `Err` means the query can't match anything.
-fn build_term(word: &str) -> Result<Option<Term>, ()> {
+fn build_term(word: &str, used: &mut Budget) -> Result<Option<Term>, ()> {
     let (neg, body) = match word.strip_prefix('!') {
         Some(rest) => (true, rest),
         None => (false, word),
@@ -594,6 +608,10 @@ fn build_term(word: &str) -> Result<Option<Term>, ()> {
     if let Some(pat) = head("regex:") {
         if pat.is_empty() {
             return Ok(None);
+        }
+        used.regex += 1;
+        if used.regex > MAX_REGEX_TERMS {
+            return Err(());
         }
         let re = RegexBuilder::new(pat)
             .case_insensitive(true)
@@ -637,6 +655,10 @@ fn build_term(word: &str) -> Result<Option<Term>, ()> {
         return Ok(None);
     }
     let kind = if is_path {
+        used.path += 1;
+        if used.path > MAX_PATH_TERMS {
+            return Err(());
+        }
         let glob = Glob::path(&pat);
         TermKind::Path(PathTerm {
             anchor_start: glob.anchor_start,
@@ -656,6 +678,7 @@ impl Query {
         let mut raw_groups: Vec<Vec<Term>> = vec![Vec::new()];
         let mut invalid = false;
         let mut count = 0;
+        let mut used = Budget::default();
         for tok in tokenize(text) {
             match tok {
                 Tok::Or => raw_groups.push(Vec::new()),
@@ -663,7 +686,7 @@ impl Query {
                     if count >= MAX_TERMS {
                         break;
                     }
-                    match build_term(&w) {
+                    match build_term(&w, &mut used) {
                         Ok(Some(t)) => {
                             count += 1;
                             raw_groups.last_mut().unwrap().push(t);
@@ -1014,6 +1037,49 @@ mod tests {
         assert!(Query::parse("  ").is_empty());
         // Unterminated quote: the rest is one term.
         assert!(m("\"my fi", r"C:\my file.txt"));
+    }
+
+    #[test]
+    fn too_many_regex_or_path_terms_match_nothing() {
+        let ok = (0..MAX_REGEX_TERMS).map(|i| format!("regex:a{i}")).collect::<Vec<_>>().join(" ");
+        assert!(!Query::parse(&ok).is_invalid());
+        assert!(Query::parse(&format!("{ok} regex:b")).is_invalid());
+        let ok = (0..MAX_PATH_TERMS).map(|i| format!("a{i}\\b")).collect::<Vec<_>>().join(" ");
+        assert!(!Query::parse(&ok).is_invalid());
+        assert!(Query::parse(&format!("{ok} x\\y")).is_invalid());
+    }
+
+    #[test]
+    fn regex_literals_are_folded_like_names() {
+        // Whole-string lowercasing would give a final sigma ('ς'); names fold per character.
+        assert_eq!(regex_literals("\u{391}\u{3A3}").unwrap(), vec![fold("\u{391}\u{3A3}")]);
+        assert_eq!(fold("\u{391}\u{3A3}"), "\u{3b1}\u{3c3}".as_bytes());
+    }
+
+    /// Random operators and awkward characters never panic, whatever the input.
+    #[test]
+    fn odd_input_never_panics() {
+        let mut x = 0x0DDB_1A5E_5BAD_5EEDu64;
+        let mut rnd = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        let atoms = [
+            "*", "?", "|", "!", "\"", " ", "\\", "/", ":", ".", "c:", "regex:", "ext:", "(", "[", "{2,", "\\d",
+            "a", "B", "\u{130}", "\u{23A}", "\u{2C6E}", "\u{3A3}", "\u{df}", "\u{e9}", "\u{1F600}", "e\u{301}",
+            "\u{0}", "\u{FFFD}", "\u{17F}", "\u{212A}",
+        ];
+        let names = ["a.png", "\u{130}stanbul", "\u{23A}\u{2C6E}", "\u{391}\u{3A3}", "stra\u{df}e.txt", "x", "\u{1F600}.gif", "e\u{301}"];
+        for _ in 0..4000 {
+            let q: String = (0..1 + rnd(10)).map(|_| atoms[rnd(atoms.len())]).collect();
+            let p = Query::parse(&q);
+            for n in names {
+                let _ = p.matches_path(&format!("C:\\dir\\{n}"));
+                let _ = p.highlight(n);
+            }
+        }
     }
 
     #[test]
