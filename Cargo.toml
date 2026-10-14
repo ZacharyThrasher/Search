@@ -13,6 +13,11 @@ path = "src/lib.rs"
 name = "s"
 path = "src/main.rs"
 
+# The elevated helper: owns the index and answers the popup over a named pipe.
+[[bin]]
+name = "searchd"
+path = "src/bin/searchd.rs"
+
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 memchr = "2.8"
@@ -23,9 +28,24 @@ rustc-hash = "2.1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Registry",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Kernel",
+    "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }

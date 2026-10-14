@@ -391,6 +391,7 @@ fn print_stats(engine: &Engine) {
 }
 
 fn main() -> ExitCode {
+    sys::quiet_errors();
     let cli = Cli::parse();
 
     let mut queries: Vec<String> = Vec::new();

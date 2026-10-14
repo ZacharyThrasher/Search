@@ -3,9 +3,13 @@
 
 pub mod fmt;
 pub mod index;
+pub mod ipc;
 pub mod live;
 #[cfg(windows)]
 pub mod mft;
+#[cfg(windows)]
+pub mod pipe;
+pub mod popup;
 pub mod selftest;
 pub mod snapshot;
 pub mod sys;

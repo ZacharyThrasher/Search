@@ -51,7 +51,7 @@ if (Test-Path $snap) { Remove-Item -Recurse -Force $snap }
 New-Item -ItemType Directory -Force $snap | Out-Null
 
 cargo build --release
-if ($LASTEXITCODE -ne 0) { Read-Host 'build failed, press Enter'; exit 1 }
+if ($LASTEXITCODE -ne 0) { if (-not $env:SEARCH_RUNNER) { Read-Host 'build failed, press Enter' }; exit 1 }
 $exe = Join-Path (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory 'release\s.exe'
 
 Log "# $(Get-Date -Format o)  host=$env:COMPUTERNAME  commit=$(git rev-parse --short HEAD)"
@@ -125,6 +125,57 @@ foreach ($i in 1..3) {
     Log ("  run {0}: {1:N2} s wall   {2}" -f $i, $sw.Elapsed.TotalSeconds, $ready)
 }
 
+# 5. the elevated helper (searchd) and its pipe, as the popup uses them
+Log "`n## 5. HELPER: searchd serves ranked queries over its pipe; live changes show up; shutdown saves"
+$binDir = Split-Path $exe -Parent
+$searchd = Join-Path $binDir 'searchd.exe'
+$searchq = Join-Path $binDir 'searchq.exe'
+$tag = 'live-test'
+$helperSnap = Join-Path $snap 'helper'
+New-Item -ItemType Directory -Force $helperSnap | Out-Null
+$hv = @(); foreach ($v in $Volumes) { $hv += @('-v', $v) }
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$hp = Start-Process -FilePath $searchd -ArgumentList (@('--pipe-tag', $tag, '--data-dir', "`"$helperSnap`"", '--rescan') + $hv) -WindowStyle Hidden -PassThru
+function Q([string[]]$a) { $r = & $searchq @('--pipe-tag', $tag) @a 2>&1 | ForEach-Object { "$_" }; return ,@($r) }
+$o = Q @('--wait', '180', '--status')
+$sw.Stop()
+Log ("  helper ready after {0:N1} s" -f $sw.Elapsed.TotalSeconds)
+$o | ForEach-Object { Log "  $_" }
+if (($o -join "`n") -notmatch 'elevated: true') { $failures.Add('helper is not elevated') }
+if (($o -join "`n") -notmatch '(\d+) entries') { $failures.Add('helper reported no entries') }
+
+# ranked results: exact stem first, then prefix, then substring
+$o = Q @('--limit', '8', 'notepad')
+Log '  query "notepad":'; $o | ForEach-Object { Log "    $_" }
+if (-not ($o -match 'notepad')) { $failures.Add('helper found nothing for notepad') }
+
+# a new file shows up within a second, and ranks first as an exact match
+New-Item -Force -ItemType Directory $TestDir | Out-Null
+$tok = 'helperlive' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+Set-Content (Join-Path $TestDir "$tok.txt") 'x'
+$seen = $false; $t = [Diagnostics.Stopwatch]::StartNew()
+while ($t.Elapsed.TotalSeconds -lt 3) {
+    $o = Q @('--limit', '3', $tok)
+    if (($o -join "`n") -match [regex]::Escape("$tok.txt")) { $seen = $true; break }
+    Start-Sleep -Milliseconds 50
+}
+Log ("  new file visible through the helper: {0} ({1:N2} s)" -f $seen, $t.Elapsed.TotalSeconds)
+if (-not $seen) { $failures.Add('helper did not see a new file') }
+
+# latency over the pipe, narrow and very broad queries
+foreach ($q in @('notepad', 'readme', 'a')) {
+    $o = Q @('--bench', '100', $q)
+    Log "  $q : $($o | Where-Object { $_ -match 'round trip' })"
+}
+
+# shutdown writes the snapshots and the process exits
+$o = Q @('--shutdown')
+$hp.WaitForExit(30000) | Out-Null
+Log "  shutdown: exited=$($hp.HasExited)  snapshots in helper dir: $((Get-ChildItem $helperSnap -Filter *.snap -ErrorAction SilentlyContinue | Measure-Object).Count)"
+if (-not $hp.HasExited) { $failures.Add('helper did not exit on shutdown'); $hp.Kill() }
+elseif (-not (Get-ChildItem $helperSnap -Filter *.snap -ErrorAction SilentlyContinue)) { $failures.Add('helper did not save a snapshot on shutdown') }
+Log ("  helper log tail:"); Get-Content (Join-Path $helperSnap 'searchd.log') -Tail 6 -ErrorAction SilentlyContinue | ForEach-Object { Log "    $_" }
+
 # cleanup
 if (Test-Path $TestDir) { Remove-Item -Recurse -Force $TestDir -ErrorAction SilentlyContinue }
 
@@ -132,4 +183,4 @@ Log ""
 if ($failures.Count -eq 0) { Log "RESULT: PASS" } else { Log "RESULT: FAIL"; $failures | ForEach-Object { Log "  - $_" } }
 Set-Content -Path $out -Value $lines -Encoding UTF8
 Write-Host "`nSaved to $((Resolve-Path $out).Path)"
-Read-Host 'Press Enter to close'
+if (-not $env:SEARCH_RUNNER) { Read-Host 'Press Enter to close' }   # the admin runner sets SEARCH_RUNNER: no console to wait on
