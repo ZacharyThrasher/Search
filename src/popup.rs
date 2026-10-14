@@ -4,6 +4,8 @@
 
 use std::ops::Range;
 
+use crate::query::Query;
+
 /// Modifier bits, the same values Windows uses for `RegisterHotKey`.
 pub const MOD_ALT: u32 = 0x0001;
 pub const MOD_CONTROL: u32 = 0x0002;
@@ -219,42 +221,24 @@ pub fn split_path(path: &str) -> (&str, &str) {
     }
 }
 
-/// Byte ranges of `name` that match any whitespace-separated term of `query`,
-/// case-insensitively, sorted and merged. Empty if case folding changes the
-/// byte length of the name (positions would not line up).
+/// Byte ranges of `name` that the positive terms of `query` matched (plain
+/// text, the literal parts of wildcards, `ext:`, `regex:`), sorted and merged.
+/// Empty if case folding changes the byte length of the name (positions would
+/// not line up).
 pub fn highlight_ranges(name: &str, query: &str) -> Vec<Range<usize>> {
-    let lname = name.to_lowercase();
-    if lname.len() != name.len() {
-        return Vec::new();
+    thread_local! {
+        // Rows are painted one after another with the same query: parse it once.
+        static PARSED: std::cell::RefCell<Option<(String, Query)>> = const { std::cell::RefCell::new(None) };
     }
-    let mut spans: Vec<Range<usize>> = Vec::new();
-    for term in query.split_whitespace() {
-        let lt = term.to_lowercase();
-        if lt.is_empty() {
-            continue;
+    PARSED.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(text, _)| text != query) {
+            *slot = Some((query.to_string(), Query::parse(query)));
         }
-        let mut from = 0;
-        while let Some(i) = lname[from..].find(&lt) {
-            let start = from + i;
-            spans.push(start..start + lt.len());
-            from = start + lt.len();
-        }
-    }
-    spans.sort_by_key(|r| r.start);
-    let mut merged: Vec<Range<usize>> = Vec::new();
-    for s in spans {
-        match merged.last_mut() {
-            Some(last) if s.start <= last.end => last.end = last.end.max(s.end),
-            _ => merged.push(s),
-        }
-    }
-    // Folding can move characters while keeping the total length (a 2-byte
-    // capital that lowercases to 3 bytes next to a 3-byte one that shrinks to 2),
-    // so offsets in the folded text may not be boundaries in `name`.
-    if merged.iter().any(|r| !name.is_char_boundary(r.start) || !name.is_char_boundary(r.end)) {
-        return Vec::new();
-    }
-    merged
+        slot.as_ref()
+            .map(|(_, q)| q.highlight(name))
+            .unwrap_or_default()
+    })
 }
 
 /// Selection and scrolling over a list of `len` rows of which `visible` fit.

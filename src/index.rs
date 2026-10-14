@@ -23,6 +23,8 @@
 use memchr::memmem;
 use rayon::prelude::*;
 
+use crate::query::{PathSource, Query};
+
 pub const NONE: u32 = u32::MAX;
 const FLAG_DIR: u8 = 1;
 const FLAG_ROOT: u8 = 2;
@@ -33,7 +35,11 @@ const FLAG_DEAD: u8 = 4;
 pub const MAX_REC: u64 = 1 << 28;
 
 /// Below this many entries a single-threaded scan beats the fork/join cost.
+#[cfg(not(test))]
 const PAR_THRESHOLD: usize = 200_000;
+/// Tests make the parallel path cheap to reach.
+#[cfg(test)]
+const PAR_THRESHOLD: usize = 4_000;
 
 /// Case-fold `name` and append it (without terminator) to `out`.
 /// ASCII fast path; everything else goes through Unicode lowercase.
@@ -533,11 +539,6 @@ pub struct QueryResult {
     pub total: usize,
 }
 
-struct Plan {
-    driver: Option<memmem::Finder<'static>>,
-    extras: Vec<memmem::Finder<'static>>,
-}
-
 impl Index {
     /// Entry slots, including dead ones (see `live_len`).
     pub fn len(&self) -> usize {
@@ -609,37 +610,40 @@ impl Index {
         out
     }
 
-    fn plan(&self, query: &str) -> Plan {
-        let mut terms: Vec<Vec<u8>> = query
-            .split_whitespace()
-            .map(|t| {
-                let mut v = Vec::with_capacity(t.len());
-                fold_into(t, &mut v);
-                v.retain(|&b| b != 0);
-                v
-            })
-            .filter(|t| !t.is_empty())
-            .collect();
-        if terms.is_empty() {
-            return Plan {
-                driver: None,
-                extras: Vec::new(),
-            };
+    /// Case-folded full path of entry `e` (as `path`, but lowercase) into `s.buf`.
+    fn folded_path_into(&self, e: usize, s: &mut Scratch) {
+        s.chain.clear();
+        let mut cur = e;
+        let mut rooted = false;
+        for _ in 0..4096 {
+            s.chain.push(cur);
+            if self.flags[cur] & FLAG_ROOT != 0 {
+                rooted = true;
+                break;
+            }
+            let p = self.parent[cur];
+            match self.lookup(p) {
+                Some(next) if p != NONE && next as usize != cur => cur = next as usize,
+                _ => break,
+            }
         }
-        // Longest term drives the scan: it is usually the rarest.
-        let longest = (0..terms.len()).max_by_key(|&i| terms[i].len()).unwrap();
-        let driver = terms.swap_remove(longest);
-        Plan {
-            driver: Some(memmem::Finder::new(&driver).into_owned()),
-            extras: terms
-                .iter()
-                .map(|t| memmem::Finder::new(t).into_owned())
-                .collect(),
+        s.buf.clear();
+        if !rooted {
+            s.buf.extend_from_slice(b"<orphan>");
+        }
+        for &i in s.chain.iter().rev() {
+            if !s.buf.is_empty() {
+                s.buf.push(b'\\');
+            }
+            s.buf.extend_from_slice(self.lower_name(i));
+        }
+        if s.chain.len() == 1 && rooted && s.buf.ends_with(b":") {
+            s.buf.push(b'\\');
         }
     }
 
     #[inline]
-    fn accept(&self, e: usize, plan: &Plan, kind: Kind) -> bool {
+    fn accept(&self, e: usize, q: &Query, kind: Kind, scratch: &mut Scratch) -> bool {
         let flags = self.flags[e];
         if flags & FLAG_DEAD != 0 {
             return false;
@@ -650,11 +654,41 @@ impl Index {
             Kind::Dirs if flags & FLAG_DIR == 0 => return false,
             _ => {}
         }
-        if plan.extras.is_empty() {
-            return true;
+        let mut path = EntryPath {
+            ix: self,
+            e,
+            scratch,
+            ready: false,
+        };
+        q.eval(
+            self.lower_name(e),
+            self.orig_bytes(e),
+            &mut path,
+            q.drivers.is_some(),
+        )
+    }
+
+    /// Next entry in `e0..e1` (after `*lo`) whose name contains the finder's bytes.
+    #[inline]
+    fn next_candidate(
+        &self,
+        finder: &memmem::Finder<'_>,
+        hay: &[u8],
+        base: usize,
+        cur: &mut (usize, usize),
+        e1: usize,
+    ) -> Option<usize> {
+        let (pos, lo) = cur;
+        if *pos >= hay.len() {
+            return None;
         }
-        let name = self.lower_name(e);
-        plan.extras.iter().all(|f| f.find(name).is_some())
+        let h = finder.find(&hay[*pos..])?;
+        let abs = base + *pos + h;
+        // Entry containing `abs`: last start offset <= abs.
+        let e = *lo + self.lower_off[*lo..e1].partition_point(|&o| o as usize <= abs) - 1;
+        *pos = self.lower_off[e + 1] as usize - base;
+        *lo = e + 1;
+        Some(e)
     }
 
     /// Call `f(entry)` for every accepted entry in `e0..e1`, in index order,
@@ -663,13 +697,14 @@ impl Index {
         &self,
         e0: usize,
         e1: usize,
-        plan: &Plan,
+        q: &Query,
         kind: Kind,
         f: &mut dyn FnMut(usize) -> bool,
     ) {
-        let Some(driver) = &plan.driver else {
+        let mut scratch = Scratch::default();
+        let Some(finders) = q.drivers.as_ref().filter(|_| !q.groups.is_empty()) else {
             for e in e0..e1 {
-                if self.accept(e, plan, kind) && f(e) {
+                if self.accept(e, q, kind, &mut scratch) && f(e) {
                     return;
                 }
             }
@@ -677,30 +712,31 @@ impl Index {
         };
         let base = self.lower_off[e0] as usize;
         let hay = &self.lower[base..self.lower_off[e1] as usize];
-        let mut pos = 0usize;
-        let mut lo = e0;
-        while pos < hay.len() {
-            let Some(h) = driver.find(&hay[pos..]) else {
-                break;
-            };
-            let abs = base + pos + h;
-            // Entry containing `abs`: last start offset <= abs.
-            let e = lo + self.lower_off[lo..e1].partition_point(|&o| o as usize <= abs) - 1;
-            pos = self.lower_off[e + 1] as usize - base;
-            lo = e + 1;
-            if self.accept(e, plan, kind) && f(e) {
+        // One cursor per fragment; each yields entries in order, merged here.
+        let mut cursors: Vec<((usize, usize), Option<usize>)> =
+            vec![((0, e0), None); finders.len()];
+        for (c, finder) in cursors.iter_mut().zip(finders) {
+            c.1 = self.next_candidate(finder, hay, base, &mut c.0, e1);
+        }
+        while let Some(e) = cursors.iter().filter_map(|c| c.1).min() {
+            for (c, finder) in cursors.iter_mut().zip(finders) {
+                if c.1 == Some(e) {
+                    c.1 = self.next_candidate(finder, hay, base, &mut c.0, e1);
+                }
+            }
+            if self.accept(e, q, kind, &mut scratch) && f(e) {
                 return;
             }
         }
     }
 
-    fn scan_chunk(&self, e0: usize, e1: usize, plan: &Plan, opts: QueryOpts) -> (usize, Vec<u32>) {
+    fn scan_chunk(&self, e0: usize, e1: usize, q: &Query, opts: QueryOpts) -> (usize, Vec<u32>) {
         let mut hits = Vec::new();
         let mut count = 0usize;
-        if plan.driver.is_some() && !opts.count_total && opts.limit == 0 {
+        if !opts.count_total && opts.limit == 0 && !q.groups.is_empty() {
             return (0, hits);
         }
-        self.for_each_match(e0, e1, plan, opts.kind, &mut |e| {
+        self.for_each_match(e0, e1, q, opts.kind, &mut |e| {
             count += 1;
             if hits.len() < opts.limit {
                 hits.push(e as u32);
@@ -710,12 +746,17 @@ impl Index {
         (count, hits)
     }
 
-    /// Case-insensitive substring search over file names. Whitespace-separated
-    /// terms must all appear in the name (AND). Results are in index order.
+    /// Case-insensitive search over file names; see `crate::query` for the
+    /// syntax (substrings, `*` `?`, `|`, `!`, `ext:`, paths, `regex:`).
+    /// Whitespace-separated terms must all match (AND). Results are in index
+    /// order. An empty query matches everything, a broken one nothing.
     pub fn search(&self, query: &str, opts: QueryOpts) -> QueryResult {
-        let plan = self.plan(query);
+        self.search_query(&Query::parse(query), opts)
+    }
+
+    pub fn search_query(&self, q: &Query, opts: QueryOpts) -> QueryResult {
         let n = self.len();
-        if n == 0 {
+        if n == 0 || q.is_invalid() {
             return QueryResult {
                 hits: Vec::new(),
                 total: 0,
@@ -730,11 +771,11 @@ impl Index {
             .map(|k| (k * n / chunks, (k + 1) * n / chunks))
             .collect();
         let parts: Vec<(usize, Vec<u32>)> = if chunks == 1 {
-            vec![self.scan_chunk(0, n, &plan, opts)]
+            vec![self.scan_chunk(0, n, q, opts)]
         } else {
             ranges
                 .par_iter()
-                .map(|&(a, b)| self.scan_chunk(a, b, &plan, opts))
+                .map(|&(a, b)| self.scan_chunk(a, b, q, opts))
                 .collect()
         };
         let mut total = 0;
@@ -789,38 +830,33 @@ impl Index {
         if name.starts_with(first) { 1 } else { 2 }
     }
 
-    /// Best `limit` matches ordered exact name, then name prefix, then
-    /// substring; within a class the shorter path first (then index order).
-    /// An empty query returns nothing. `total` counts every match.
+    /// Best `limit` matches. A query of plain terms (optionally with `!` and
+    /// `ext:` filters) is ordered exact name, then name prefix, then substring;
+    /// anything fancier (wildcards, `|`, paths, regex) has no such classes and
+    /// goes by path length then name. Within a class the shorter path first.
+    /// An empty or broken query returns nothing. `total` counts every match.
     pub fn search_ranked(&self, query: &str, kind: Kind, limit: usize) -> RankedResult {
-        let plan = self.plan(query);
+        self.search_ranked_query(&Query::parse(query), kind, limit)
+    }
+
+    pub fn search_ranked_query(&self, q: &Query, kind: Kind, limit: usize) -> RankedResult {
         let n = self.len();
-        if n == 0 || limit == 0 || plan.driver.is_none() {
+        if n == 0 || limit == 0 || q.is_empty() || q.is_invalid() {
             return RankedResult::default();
         }
-        // Folded terms in typed order: `whole` is "a b", `first` is "a".
-        let folded: Vec<Vec<u8>> = query
-            .split_whitespace()
-            .map(|t| {
-                let mut v = Vec::with_capacity(t.len());
-                fold_into(t, &mut v);
-                v.retain(|&b| b != 0);
-                v
-            })
-            .filter(|t| !t.is_empty())
-            .collect();
-        let whole = folded.join(&b' ');
-        let first = folded[0].clone();
+        let keys = q.class_keys();
+        let by_name = keys.is_none();
 
         let chunk = |e0: usize, e1: usize| -> (usize, Vec<RankedHit>) {
-            let mut heap: std::collections::BinaryHeap<RankedHit> = std::collections::BinaryHeap::new();
+            let mut heap: std::collections::BinaryHeap<HeapItem<'_>> =
+                std::collections::BinaryHeap::new();
             let mut count = 0usize;
-            self.for_each_match(e0, e1, &plan, kind, &mut |e| {
+            self.for_each_match(e0, e1, q, kind, &mut |e| {
                 count += 1;
-                let class = self.rank_class(e, &whole, &first);
+                let class = keys.map_or(0, |(whole, first)| self.rank_class(e, whole, first));
                 let full = heap.len() >= limit;
                 let cap = if full {
-                    let worst = heap.peek().unwrap();
+                    let worst = &heap.peek().unwrap().hit;
                     if class > worst.class {
                         return false;
                     }
@@ -837,7 +873,15 @@ impl Index {
                 if path_len >= cap && cap != u32::MAX {
                     return false; // longer than the current worst
                 }
-                let hit = RankedHit { class, path_len, entry: e as u32 };
+                let hit = HeapItem {
+                    hit: RankedHit {
+                        class,
+                        path_len,
+                        entry: e as u32,
+                    },
+                    ix: self,
+                    by_name,
+                };
                 if !full {
                     heap.push(hit);
                 } else if hit < *heap.peek().unwrap() {
@@ -846,7 +890,7 @@ impl Index {
                 }
                 false
             });
-            (count, heap.into_vec())
+            (count, heap.into_iter().map(|h| h.hit).collect())
         };
 
         let chunks = if n < PAR_THRESHOLD { 1 } else { rayon::current_num_threads() * 4 };
@@ -864,9 +908,81 @@ impl Index {
             total += c;
             hits.extend(h);
         }
-        hits.sort_unstable();
+        hits.sort_unstable_by(|a, b| self.rank_cmp(a, b, by_name));
         hits.truncate(limit);
-        RankedResult { hits, total }
+        RankedResult {
+            hits,
+            total,
+            by_name,
+        }
+    }
+
+    /// Ranking order: class, then shorter path, then (in queries without
+    /// classes) the name, then index order.
+    fn rank_cmp(&self, a: &RankedHit, b: &RankedHit, by_name: bool) -> std::cmp::Ordering {
+        (a.class, a.path_len)
+            .cmp(&(b.class, b.path_len))
+            .then_with(|| {
+                if by_name {
+                    self.lower_name(a.entry as usize)
+                        .cmp(self.lower_name(b.entry as usize))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then(a.entry.cmp(&b.entry))
+    }
+}
+
+/// A ranked hit in a heap: smaller is better, so the heap's top is the worst kept.
+struct HeapItem<'a> {
+    hit: RankedHit,
+    ix: &'a Index,
+    by_name: bool,
+}
+
+impl Ord for HeapItem<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ix.rank_cmp(&self.hit, &other.hit, self.by_name)
+    }
+}
+
+impl PartialOrd for HeapItem<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for HeapItem<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for HeapItem<'_> {}
+
+/// Reusable buffers for building an entry's folded path during a scan.
+#[derive(Default)]
+struct Scratch {
+    buf: Vec<u8>,
+    chain: Vec<usize>,
+}
+
+/// The folded path of one entry, built the first time a path term asks.
+struct EntryPath<'a> {
+    ix: &'a Index,
+    e: usize,
+    scratch: &'a mut Scratch,
+    ready: bool,
+}
+
+impl PathSource for EntryPath<'_> {
+    fn folded(&mut self) -> &[u8] {
+        if !self.ready {
+            self.ix.folded_path_into(self.e, self.scratch);
+            self.ready = true;
+        }
+        &self.scratch.buf
     }
 }
 
@@ -882,6 +998,8 @@ pub struct RankedHit {
 pub struct RankedResult {
     pub hits: Vec<RankedHit>,
     pub total: usize,
+    /// Ties go by name (a query without classes) rather than by entry order.
+    pub by_name: bool,
 }
 
 #[cfg(test)]
@@ -1175,7 +1293,7 @@ mod tests {
         };
         for q in ["seven", "file1", "9_s", "dat seven", "zzz"] {
             let par = ix.search(q, opts);
-            let plan = ix.plan(q);
+            let plan = Query::parse(q);
             let (count, hits) = ix.scan_chunk(0, ix.len(), &plan, opts);
             assert_eq!(par.total, count, "query {q}");
             assert_eq!(par.hits, hits, "query {q}");
@@ -1549,4 +1667,159 @@ mod tests {
         assert!(Index::from_parts(bad).is_err());
     }
 
+    /// A random tree searched with every kind of term must agree with testing
+    /// each entry's full path one by one, whichever way the scan is driven.
+    #[test]
+    fn query_language_matches_a_brute_force_check_on_a_random_tree() {
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        let exts = ["png", "gif", "txt", "tar.gz", ""];
+        let stems = [
+            "cat",
+            "dog",
+            "cat_reaction",
+            "Report",
+            "notes",
+            "a",
+            "b\u{e9}b",
+        ];
+        let mut b = Builder::new();
+        b.begin_volume("T:", 5);
+        let n_dirs = 60u64;
+        for d in 0..n_dirs {
+            let parent = if d < 3 {
+                5
+            } else {
+                100 + rnd(d as usize) as u64
+            };
+            let name = ["Desktop", "src", "Users", "pics", "x"][rnd(5)];
+            b.push(100 + d, parent, &format!("{name}{}", d % 4), true);
+        }
+        let n = PAR_THRESHOLD * 2 + 31;
+        for i in 0..n {
+            let ext = exts[rnd(exts.len())];
+            let name = format!(
+                "{}{}{}{ext}",
+                stems[rnd(stems.len())],
+                rnd(20),
+                if ext.is_empty() { "" } else { "." }
+            );
+            b.push(
+                1000 + i as u64,
+                100 + rnd(n_dirs as usize) as u64,
+                &name,
+                rnd(40) == 0,
+            );
+        }
+        b.end_volume();
+        let ix = b.build();
+        let queries = [
+            "cat",
+            "*.png",
+            "*_reaction*.gif",
+            "cat?.png",
+            "c*t1*",
+            "ext:png;gif",
+            "ext:tar.gz",
+            "ext:png report",
+            "cat | dog",
+            "cat | regex:^dog",
+            "report !ext:txt",
+            "!cat",
+            "???",
+            "?",
+            "*",
+            "regex:^cat\\d+\\.png$",
+            "regex:r.p",
+            "regex:(cat|dog)\\d+",
+            "regex:1\\.png$",
+            "regex:^REPORT",
+            "regex:_reac(tion)?\\d",
+            "regex:\\.(gif|txt)$ !cat",
+            "desktop0\\*.png",
+            "pics1/",
+            "src2\\cat",
+            "t:\\users*\\*.gif",
+            "!*.png !*.gif cat",
+            "regex:(",
+            "zzz",
+            "cat dog",
+            "b\u{e9}b*",
+            "*.TXT | ext:gif cat",
+            "x3\\ ext:png",
+        ];
+        let opts = QueryOpts {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let all_paths: Vec<String> = (0..ix.len() as u32).map(|e| ix.path(e)).collect();
+        for q in queries {
+            let parsed = Query::parse(q);
+            let got = ix.search_query(&parsed, opts);
+            let want: Vec<u32> = (0..ix.len() as u32)
+                .filter(|&e| !parsed.is_invalid() && parsed.matches_path(&all_paths[e as usize]))
+                .collect();
+            assert_eq!(got.total, want.len(), "total for {q:?}");
+            assert_eq!(got.hits, want, "hits for {q:?}");
+            // Ranked: same matches, ordered by (class, path length, ...).
+            let r = ix.search_ranked_query(&parsed, Kind::Any, 25);
+            if parsed.is_empty() || parsed.is_invalid() {
+                assert!(r.hits.is_empty(), "{q:?}");
+                continue;
+            }
+            assert_eq!(r.total, want.len(), "ranked total for {q:?}");
+            assert_eq!(r.by_name, parsed.is_flat());
+            if parsed.is_flat() {
+                let mut best: Vec<(u32, String, u32)> = want
+                    .iter()
+                    .map(|&e| {
+                        (
+                            ix.path_len_capped(e as usize, u32::MAX),
+                            String::from_utf8(ix.lower_name(e as usize).to_vec()).unwrap(),
+                            e,
+                        )
+                    })
+                    .collect();
+                best.sort();
+                best.truncate(25);
+                let got: Vec<(u32, String, u32)> = r
+                    .hits
+                    .iter()
+                    .map(|h| {
+                        (
+                            h.path_len,
+                            String::from_utf8(ix.lower_name(h.entry as usize).to_vec()).unwrap(),
+                            h.entry,
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    got.iter().map(|g| (g.0, g.1.clone())).collect::<Vec<_>>(),
+                    best.iter().map(|g| (g.0, g.1.clone())).collect::<Vec<_>>(),
+                    "ranked order for {q:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wildcard_and_path_queries_on_a_small_tree() {
+        let ix = sample();
+        let q = |s: &str| paths(&ix, s);
+        assert_eq!(q("*.pdf").len(), 1);
+        assert!(q("*.pdf")[0].ends_with("Résumé Final.PDF"));
+        assert!(q("*inal.pdf").len() == 1);
+        assert!(q("*.zzz").is_empty());
+        assert!(q("regex:(").is_empty());
+        assert_eq!(q(r"users\zach\*.pdf").len(), 1);
+        // A wildcard anchors on the name, and the folder `Zach` is itself a name.
+        assert_eq!(q("zach*"), vec!["C:\\Users\\Zach".to_string()]);
+        assert!(q("*zach").len() == 1 && q("*zach*").len() == 1);
+        assert!(q("users*").len() == 1); // not the files under Users
+    }
 }

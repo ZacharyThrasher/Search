@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::fmt::{age, commas, dur, mib};
 use crate::index::{Applied, Index, Kind, QueryOpts};
+use crate::query::Query;
 use crate::snapshot::{self, LoadError, Meta};
 use crate::usn::{REASON_FILE_CREATE, REASON_FILE_DELETE, REASON_RENAME_NEW_NAME};
 
@@ -628,13 +629,14 @@ impl Engine {
     pub fn search(&self, query: &str, opts: QueryOpts) -> SearchResult {
         let mut hits: Vec<Hit> = Vec::new();
         let mut total = 0;
+        let q = Query::parse(query);
         for (vi, v) in self.vols.iter().enumerate() {
             if !opts.count_total && hits.len() >= opts.limit {
                 break;
             }
             let st = rd(&v.state);
-            let r = st.index.search(
-                query,
+            let r = st.index.search_query(
+                &q,
                 QueryOpts {
                     limit: opts.limit.saturating_sub(hits.len()),
                     ..opts
@@ -656,9 +658,10 @@ impl Engine {
     pub fn search_ranked(&self, query: &str, kind: Kind, limit: usize) -> SearchResult {
         let mut cands: Vec<(u8, u32, usize, Hit)> = Vec::new();
         let mut total = 0;
+        let q = Query::parse(query);
         for (vi, v) in self.vols.iter().enumerate() {
             let st = rd(&v.state);
-            let r = st.index.search_ranked(query, kind, limit);
+            let r = st.index.search_ranked_query(&q, kind, limit);
             total += r.total;
             cands.extend(r.hits.iter().map(|h| {
                 let hit = Hit {
@@ -669,7 +672,13 @@ impl Engine {
                 (h.class, h.path_len, vi, hit)
             }));
         }
-        cands.sort_by_key(|c| (c.0, c.1, c.2));
+        if q.is_flat() {
+            // No exact/prefix classes: shorter path, then file name, then volume.
+            let name = |h: &Hit| h.path.rsplit('\\').next().unwrap_or("").to_lowercase();
+            cands.sort_by_cached_key(|c| (c.0, c.1, name(&c.3), c.2));
+        } else {
+            cands.sort_by_key(|c| (c.0, c.1, c.2));
+        }
         cands.truncate(limit);
         SearchResult {
             hits: cands.into_iter().map(|c| c.3).collect(),

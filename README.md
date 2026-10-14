@@ -41,7 +41,7 @@ cargo build --release
 
 Flags worth knowing: `--rescan` (ignore the snapshot, scan, save), `--no-snapshot` (step-1 behavior), `--save` (write the snapshot on exit even if little changed), `--no-live` (interactive without tailing), `--data-dir DIR`, `--live-test DIR`. In interactive mode `:stats` shows per-volume state.
 
-Query rules: case-insensitive substring on the **file name**; several words must all appear (any order); `-d` dirs only, `-f` files only, `--no-count` stops after the first page.
+Query rules: case-insensitive on the **file name**; several words must all appear (any order); wildcards, `|`, `!`, `ext:`, paths and `regex:` work too (see [Query syntax](#query-syntax)); `-d` dirs only, `-f` files only, `--no-count` stops after the first page.
 
 ### How a start works (per volume)
 
@@ -107,9 +107,32 @@ Names only (no content search yet). Three programs:
 
 Tray icon: click toggles the popup; right-click for Open settings file / Open log folder / Quit.
 
+### Query syntax
+
+Everything-style, case-insensitive everywhere. Plain words behave as before.
+
+| You type | It means |
+|---|---|
+| `report` | the name contains `report` |
+| `*.png` | the name **ends in** `.png` (a term with `*` or `?` must match the whole name) |
+| `*_reaction.gif` | works as typed |
+| `report*` / `*report*` | starts with / contains `report` |
+| `c?t` | `cat`, `cut`, ... (`?` is exactly one character) |
+| `report *.pdf` | space = AND |
+| `*.png \| *.gif` | `\|` = OR (AND binds tighter: `a b \| c` is `(a b) or c`) |
+| `report !draft` | leading `!` = NOT |
+| `ext:png;jpg` | the name ends in `.png` or `.jpg` |
+| `projects\*.md`, `users/zach/` | a `\` or `/` in a term matches the **full path** instead of the name. Without wildcards it is a substring of the path; with wildcards it must end at the end of the path, and only starts at the beginning when it begins with a drive (`c:\users\*\desktop\*.png`). `*` also crosses folders |
+| `regex:^img_\d+\.jpe?g$` | a regular expression on the name (the rest of the word; `\|` inside it is the regex's own) |
+| `"my file"` | quotes keep spaces (and `\|`) literal inside one term |
+
+Half-typed input never errors: a broken regex (say a trailing `regex:(`) simply shows no results.
+
+How it stays fast: every term with a literal part (`.png`, `_reaction.gif`, `report`, an `ext:` list, a regex's own prefix or suffix) is scanned for with SIMD `memmem` over the flat name buffer, with the name's terminating NUL included for end-anchored patterns so `*.png` only finds names that end in `.png`; only those candidates are checked in full. Terms with no literal (`???`, `!x`, a bare path substring) have to look at every entry.
+
 ### Ranking
 
-Matching is unchanged (case-insensitive substring on the file name; several words must all appear). Order: **exact name** (the name, or the name without its extension, equals what you typed), then **name starts with** your first word, then **anything else that matched**. Within each group the **shorter full path** wins. Recency and frequency come later.
+Order for plain words (optionally with `!` and `ext:`): **exact name** (the name, or the name without its extension, equals what you typed), then **name starts with** your first word, then **anything else that matched**. Within each group the **shorter full path** wins. Queries with wildcards, `|`, a path or a regex have no such groups: **shorter full path first, then name**. Recency and frequency come later.
 
 ### Settings
 

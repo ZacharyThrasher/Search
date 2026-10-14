@@ -10,6 +10,7 @@ pub mod mft;
 #[cfg(windows)]
 pub mod pipe;
 pub mod popup;
+pub mod query;
 pub mod selftest;
 pub mod snapshot;
 pub mod sys;
