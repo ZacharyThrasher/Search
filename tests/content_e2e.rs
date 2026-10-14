@@ -254,6 +254,16 @@ fn crawl_then_live_updates_through_a_fake_helper() {
     helper.push(EventKind::Renamed, true, &root.join("sub2"), Some(&root.join("sub")));
     eventually("folder rename", || hits(&index, "walrus") == [root.join("sub2").join("d.txt").to_string_lossy()]);
 
+    // Away and straight back: the files must come back, not be skipped as "already known".
+    std::fs::rename(root.join("sub2"), root.join("away")).unwrap();
+    helper.push(EventKind::Renamed, true, &root.join("away"), Some(&root.join("sub2")));
+    std::fs::rename(root.join("away"), root.join("sub2")).unwrap();
+    helper.push(EventKind::Renamed, true, &root.join("sub2"), Some(&root.join("away")));
+    std::thread::sleep(Duration::from_secs(4)); // let both events and the commit pass
+    eventually("folder renamed away and back", || {
+        hits(&index, "walrus") == [root.join("sub2").join("d.txt").to_string_lossy()]
+    });
+
     // The helper restarts (new epoch): the indexer subscribes again and
     // catches up on what it missed by comparing disk and index.
     write(&root.join("missed.txt"), "written while nobody was listening: capybara");
