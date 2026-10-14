@@ -36,6 +36,9 @@
 param(
     [switch]$NoBuild,
     [switch]$NoPause,
+    # The elevated helper step was already done (verify-and-install.ps1 does it
+    # under its own single UAC prompt).
+    [switch]$SkipHelper,
     # Internal: the elevated half.
     [switch]$HelperStep,
     [string]$Src,
@@ -130,10 +133,12 @@ try {
     Set-ItemProperty -Path $run -Name 'SearchIndexer' -Value ('"{0}"' -f $indexerExe)
 
     # Helper: one UAC prompt.
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-HelperStep',
-        '-Src', "`"$release`"", '-User', "`"$user`"")
-    $p = Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $argList -Wait -PassThru
-    if ($p.ExitCode -ne 0) { throw 'the helper step did not finish (was the UAC prompt declined?)' }
+    if (-not $SkipHelper) {
+        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-HelperStep',
+            '-Src', "`"$release`"", '-User', "`"$user`"")
+        $p = Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $argList -Wait -PassThru
+        if ($p.ExitCode -ne 0) { throw 'the helper step did not finish (was the UAC prompt declined?)' }
+    }
 
     Start-Process -FilePath (Join-Path $popDir 'searchpop.exe')
     Start-Process -FilePath $indexerExe -WindowStyle Hidden

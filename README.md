@@ -228,7 +228,7 @@ max_results = 20          # content matches asked from the index per query
 
 ### Install
 
-`scripts\install.ps1` now also copies `searchi.exe` next to the popup and starts it at logon (`HKCU\...\Run\SearchIndexer`); `uninstall.ps1` removes it (`-RemoveData` also deletes the content index). The helper must be reinstalled too (new protocol): one UAC prompt, as before. The index, `status.json` and `indexer.log` live in `%LOCALAPPDATA%\Search\content`; the elevated helper never writes there.
+`scripts\verify-and-install.ps1` does the live USN check and the install under a single UAC prompt (install only if the check passes). `scripts\install.ps1` now also copies `searchi.exe` next to the popup and starts it at logon (`HKCU\...\Run\SearchIndexer`); `uninstall.ps1` removes it (`-RemoveData` also deletes the content index). The helper must be reinstalled too (new protocol): one UAC prompt, as before. The index, `status.json` and `indexer.log` live in `%LOCALAPPDATA%\Search\content`; the elevated helper never writes there.
 
 ### Know before you rely on it
 
