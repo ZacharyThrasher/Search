@@ -657,29 +657,24 @@ impl Index {
         plan.extras.iter().all(|f| f.find(name).is_some())
     }
 
-    fn scan_chunk(&self, e0: usize, e1: usize, plan: &Plan, opts: QueryOpts) -> (usize, Vec<u32>) {
-        let mut hits = Vec::new();
-        let mut count = 0usize;
-        let push = |e: usize, count: &mut usize, hits: &mut Vec<u32>| -> bool {
-            *count += 1;
-            if hits.len() < opts.limit {
-                hits.push(e as u32);
-            }
-            !opts.count_total && hits.len() >= opts.limit
-        };
-
+    /// Call `f(entry)` for every accepted entry in `e0..e1`, in index order,
+    /// until it returns `true` (stop).
+    fn for_each_match(
+        &self,
+        e0: usize,
+        e1: usize,
+        plan: &Plan,
+        kind: Kind,
+        f: &mut dyn FnMut(usize) -> bool,
+    ) {
         let Some(driver) = &plan.driver else {
             for e in e0..e1 {
-                if self.accept(e, plan, opts.kind) && push(e, &mut count, &mut hits) {
-                    break;
+                if self.accept(e, plan, kind) && f(e) {
+                    return;
                 }
             }
-            return (count, hits);
+            return;
         };
-
-        if !opts.count_total && opts.limit == 0 {
-            return (0, hits);
-        }
         let base = self.lower_off[e0] as usize;
         let hay = &self.lower[base..self.lower_off[e1] as usize];
         let mut pos = 0usize;
@@ -693,10 +688,25 @@ impl Index {
             let e = lo + self.lower_off[lo..e1].partition_point(|&o| o as usize <= abs) - 1;
             pos = self.lower_off[e + 1] as usize - base;
             lo = e + 1;
-            if self.accept(e, plan, opts.kind) && push(e, &mut count, &mut hits) {
-                break;
+            if self.accept(e, plan, kind) && f(e) {
+                return;
             }
         }
+    }
+
+    fn scan_chunk(&self, e0: usize, e1: usize, plan: &Plan, opts: QueryOpts) -> (usize, Vec<u32>) {
+        let mut hits = Vec::new();
+        let mut count = 0usize;
+        if plan.driver.is_some() && !opts.count_total && opts.limit == 0 {
+            return (0, hits);
+        }
+        self.for_each_match(e0, e1, plan, opts.kind, &mut |e| {
+            count += 1;
+            if hits.len() < opts.limit {
+                hits.push(e as u32);
+            }
+            !opts.count_total && hits.len() >= opts.limit
+        });
         (count, hits)
     }
 
@@ -739,6 +749,139 @@ impl Index {
         }
         QueryResult { hits, total }
     }
+
+    /// Length in bytes of the path of entry `i`, or `cap` as soon as it is
+    /// known to be at least that long.
+    fn path_len_capped(&self, i: usize, cap: u32) -> u32 {
+        let mut total = 0u32;
+        let mut cur = i;
+        for _ in 0..4096 {
+            total = total.saturating_add(self.orig_off[cur + 1] - self.orig_off[cur]); // name + the separator
+            if total >= cap {
+                return cap;
+            }
+            if self.flags[cur] & FLAG_ROOT != 0 {
+                break;
+            }
+            let p = self.parent[cur];
+            match self.lookup(p) {
+                Some(next) if p != NONE && next as usize != cur => cur = next as usize,
+                _ => break,
+            }
+        }
+        total
+    }
+
+    /// Rank class of entry `e` for the folded query terms: 0 = the whole name
+    /// (or the name without its extension) is the query, 1 = the name starts
+    /// with the first term, 2 = anything else that matched.
+    fn rank_class(&self, e: usize, whole: &[u8], first: &[u8]) -> u8 {
+        let name = self.lower_name(e);
+        if name == whole {
+            return 0;
+        }
+        if let Some(dot) = name.iter().rposition(|&b| b == b'.')
+            && dot > 0
+            && &name[..dot] == whole
+        {
+            return 0;
+        }
+        if name.starts_with(first) { 1 } else { 2 }
+    }
+
+    /// Best `limit` matches ordered exact name, then name prefix, then
+    /// substring; within a class the shorter path first (then index order).
+    /// An empty query returns nothing. `total` counts every match.
+    pub fn search_ranked(&self, query: &str, kind: Kind, limit: usize) -> RankedResult {
+        let plan = self.plan(query);
+        let n = self.len();
+        if n == 0 || limit == 0 || plan.driver.is_none() {
+            return RankedResult::default();
+        }
+        // Folded terms in typed order: `whole` is "a b", `first` is "a".
+        let folded: Vec<Vec<u8>> = query
+            .split_whitespace()
+            .map(|t| {
+                let mut v = Vec::with_capacity(t.len());
+                fold_into(t, &mut v);
+                v.retain(|&b| b != 0);
+                v
+            })
+            .filter(|t| !t.is_empty())
+            .collect();
+        let whole = folded.join(&b' ');
+        let first = folded[0].clone();
+
+        let chunk = |e0: usize, e1: usize| -> (usize, Vec<RankedHit>) {
+            let mut heap: std::collections::BinaryHeap<RankedHit> = std::collections::BinaryHeap::new();
+            let mut count = 0usize;
+            self.for_each_match(e0, e1, &plan, kind, &mut |e| {
+                count += 1;
+                let class = self.rank_class(e, &whole, &first);
+                let full = heap.len() >= limit;
+                let cap = if full {
+                    let worst = heap.peek().unwrap();
+                    if class > worst.class {
+                        return false;
+                    }
+                    // Equal class: the path is at least as long as the name, so
+                    // a name already as long as the worst path cannot win.
+                    if class == worst.class && self.orig_off[e + 1] - self.orig_off[e] > worst.path_len {
+                        return false;
+                    }
+                    if class == worst.class { worst.path_len.saturating_add(1) } else { u32::MAX }
+                } else {
+                    u32::MAX
+                };
+                let path_len = self.path_len_capped(e, cap);
+                if path_len >= cap && cap != u32::MAX {
+                    return false; // longer than the current worst
+                }
+                let hit = RankedHit { class, path_len, entry: e as u32 };
+                if !full {
+                    heap.push(hit);
+                } else if hit < *heap.peek().unwrap() {
+                    heap.pop();
+                    heap.push(hit);
+                }
+                false
+            });
+            (count, heap.into_vec())
+        };
+
+        let chunks = if n < PAR_THRESHOLD { 1 } else { rayon::current_num_threads() * 4 };
+        let parts: Vec<(usize, Vec<RankedHit>)> = if chunks == 1 {
+            vec![chunk(0, n)]
+        } else {
+            (0..chunks)
+                .into_par_iter()
+                .map(|k| chunk(k * n / chunks, (k + 1) * n / chunks))
+                .collect()
+        };
+        let mut total = 0;
+        let mut hits = Vec::new();
+        for (c, h) in parts {
+            total += c;
+            hits.extend(h);
+        }
+        hits.sort_unstable();
+        hits.truncate(limit);
+        RankedResult { hits, total }
+    }
+}
+
+/// A ranked match. Ordering is the ranking: smaller is better.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RankedHit {
+    pub class: u8,
+    pub path_len: u32,
+    pub entry: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct RankedResult {
+    pub hits: Vec<RankedHit>,
+    pub total: usize,
 }
 
 #[cfg(test)]
@@ -872,6 +1015,147 @@ mod tests {
         let lost = ix.search("lost", QueryOpts::default()).hits[0];
         assert_eq!(ix.path(lost), "<orphan>\\lost.txt");
         assert_eq!(ix.orphans(), 1);
+    }
+
+    /// Reference ranking: scan everything, classify and measure the slow way.
+    fn naive_ranked(ix: &Index, q: &str, kind: Kind, limit: usize) -> (Vec<RankedHit>, usize) {
+        let all = ix.search(q, QueryOpts { limit: usize::MAX, kind, ..Default::default() });
+        let mut folded = Vec::new();
+        let terms: Vec<&str> = q.split_whitespace().collect();
+        for t in &terms {
+            let mut v = Vec::new();
+            fold_into(t, &mut v);
+            folded.push(String::from_utf8(v).unwrap());
+        }
+        let whole = folded.join(" ");
+        let mut v: Vec<RankedHit> = all
+            .hits
+            .iter()
+            .map(|&e| {
+                let name = String::from_utf8(ix.lower_name(e as usize).to_vec()).unwrap();
+                let stem = name.rsplit_once('.').filter(|(s, _)| !s.is_empty()).map(|(s, _)| s);
+                let class = if name == whole || stem == Some(whole.as_str()) {
+                    0
+                } else if name.starts_with(&folded[0]) {
+                    1
+                } else {
+                    2
+                };
+                // Walk to the root summing name lengths (+1 each).
+                let mut len = 0u32;
+                let mut cur = e;
+                loop {
+                    len += ix.name(cur).len() as u32 + 1;
+                    if ix.flags[cur as usize] & FLAG_ROOT != 0 {
+                        break;
+                    }
+                    cur = ix.lookup(ix.parent[cur as usize]).unwrap();
+                }
+                RankedHit { class, path_len: len, entry: e }
+            })
+            .collect();
+        v.sort();
+        v.truncate(limit);
+        (v, all.total)
+    }
+
+    #[test]
+    fn ranked_order_is_exact_then_prefix_then_substring_then_shorter_path() {
+        let mut b = Builder::new();
+        b.begin_volume("C:", 5);
+        b.push(10, 5, "Users", true);
+        b.push(11, 10, "Zach", true);
+        b.push(12, 11, "my notepad.txt", false); // substring
+        b.push(13, 11, "notepad.exe", false); // stem == query -> exact
+        b.push(14, 5, "Windows", true);
+        b.push(15, 14, "Notepad", true); // exact (case-insensitive)
+        b.push(16, 14, "notepad++.exe", false); // prefix
+        b.push(17, 5, "notepad-tools", true); // prefix, shorter path
+        b.push(18, 11, "Deep", true);
+        b.push(19, 18, "notepad.log", false); // exact stem but longest path
+        b.end_volume();
+        let ix = b.build();
+        let r = ix.search_ranked("notepad", Kind::Any, 50);
+        let got: Vec<String> = r.hits.iter().map(|h| ix.path(h.entry)).collect();
+        assert_eq!(
+            got,
+            [
+                r"C:\Windows\Notepad",
+                r"C:\Users\Zach\notepad.exe",
+                r"C:\Users\Zach\Deep\notepad.log",
+                r"C:\notepad-tools",
+                r"C:\Windows\notepad++.exe",
+                r"C:\Users\Zach\my notepad.txt",
+            ]
+        );
+        assert_eq!(r.total, 6);
+        // Limit keeps the best.
+        let r2 = ix.search_ranked("notepad", Kind::Any, 2);
+        assert_eq!(r2.hits, r.hits[..2]);
+        assert_eq!(r2.total, 6);
+        // Nothing for an empty query or limit 0; kind filter applies.
+        assert!(ix.search_ranked("  ", Kind::Any, 5).hits.is_empty());
+        assert!(ix.search_ranked("notepad", Kind::Any, 0).hits.is_empty());
+        let d = ix.search_ranked("notepad", Kind::Dirs, 50);
+        assert_eq!(d.hits.len(), 2);
+    }
+
+    #[test]
+    fn ranked_search_matches_the_naive_ranking_on_a_random_tree() {
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let syl = ["ab", "cd", "ef", "note", "pad", "Foo", "bar", "x", "ÉÀ", "doc"];
+        let mut b = Builder::new();
+        b.begin_volume("R:", 5);
+        let n = 6000u64;
+        for i in 0..n {
+            let parent = if i < 10 { 5 } else { 100 + rnd(i) };
+            let mut name = String::new();
+            for _ in 0..1 + rnd(3) {
+                name.push_str(syl[rnd(syl.len() as u64) as usize]);
+            }
+            if rnd(3) == 0 {
+                name.push_str([".txt", ".exe", ".md"][rnd(3) as usize]);
+            }
+            b.push(100 + i, parent, &name, rnd(4) == 0);
+        }
+        b.end_volume();
+        let ix = b.build();
+        for q in ["note", "notepad", "ab", "ab cd", "x", "doc.txt", "éà", "foo bar", "zzz", "pad note"] {
+            for kind in [Kind::Any, Kind::Files, Kind::Dirs] {
+                for limit in [1, 7, 50, 100_000] {
+                    let got = ix.search_ranked(q, kind, limit);
+                    let (want, total) = naive_ranked(&ix, q, kind, limit);
+                    assert_eq!(got.hits, want, "q={q:?} kind={kind:?} limit={limit}");
+                    assert_eq!(got.total, total, "q={q:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_parallel_path_agrees_with_serial() {
+        let mut b = Builder::new();
+        b.begin_volume("T:", 5);
+        let n = PAR_THRESHOLD * 2 + 17;
+        for i in 0..n {
+            let parent = if i < 50 { 5 } else { 100 + (i as u64 * 7) % 50 };
+            let name = format!("file{}{}.dat", i, if i % 7 == 0 { "_seven" } else { "" });
+            b.push(100 + i as u64, parent, &name, i % 50 == 0);
+        }
+        b.end_volume();
+        let ix = b.build();
+        for q in ["seven", "file1", "9_s", "file12345", "zzz"] {
+            let got = ix.search_ranked(q, Kind::Any, 30);
+            let (want, total) = naive_ranked(&ix, q, Kind::Any, 30);
+            assert_eq!(got.hits, want, "q={q}");
+            assert_eq!(got.total, total, "q={q}");
+        }
     }
 
     #[test]

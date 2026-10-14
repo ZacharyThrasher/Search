@@ -22,12 +22,12 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::fmt::{age, commas, dur, mib};
-use crate::index::{Applied, Index, QueryOpts};
+use crate::index::{Applied, Index, Kind, QueryOpts};
 use crate::snapshot::{self, LoadError, Meta};
 use crate::usn::{REASON_FILE_CREATE, REASON_FILE_DELETE, REASON_RENAME_NEW_NAME};
 
@@ -265,6 +265,20 @@ struct Volume {
     saved: Mutex<Option<Meta>>,
     /// Serializes snapshot writes (they share one temp file).
     save_lock: Mutex<()>,
+    /// Taken by anything that needs the write lock on `state`, and by a
+    /// snapshot write for its whole duration. A writer queued on an `RwLock`
+    /// holds back every new reader, so without this a snapshot (a long read)
+    /// plus a tail batch (a short write) would freeze queries until the
+    /// snapshot finished. With it, the tail waits here instead and the lock
+    /// is never contended by a pending writer, so queries never block.
+    write_gate: Mutex<()>,
+    /// Test hook: pretend writing the snapshot takes this long.
+    #[cfg(test)]
+    slow_save: Mutex<Duration>,
+}
+
+fn gate(m: &Mutex<()>) -> MutexGuard<'_, ()> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn rd<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -297,15 +311,19 @@ impl Volume {
         }
     }
 
-    /// Write the snapshot. Holds only the read lock, so queries continue and
+    /// Write the snapshot. Holds only the read lock (and the write gate, which
+    /// keeps the tail from queueing a writer behind it), so queries continue and
     /// the tail's next batch waits.
     fn save(&self) -> io::Result<(u64, Duration)> {
         let Some(path) = self.snapshot_path() else {
             return Ok((0, Duration::ZERO));
         };
         let _one_writer = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _no_writers = gate(&self.write_gate);
         let t = Instant::now();
         let st = rd(&self.state);
+        #[cfg(test)]
+        thread::sleep(*self.slow_save.lock().unwrap());
         let meta = Meta::now(st.journal_id, self.next_usn.load(Ordering::Acquire));
         let bytes = snapshot::save(&path, &meta, &st.index)?;
         *self.saved.lock().unwrap_or_else(|e| e.into_inner()) = Some(meta);
@@ -406,6 +424,9 @@ fn open_volume(source: &Arc<dyn Source>, cfg: &Config) -> Result<Volume, SourceE
         since_save: AtomicU64::new(since_save),
         saved: Mutex::new(saved),
         save_lock: Mutex::new(()),
+        write_gate: Mutex::new(()),
+        #[cfg(test)]
+        slow_save: Mutex::new(Duration::ZERO),
     };
 
     let journal = match source.journal() {
@@ -555,6 +576,9 @@ impl Engine {
                     since_save: AtomicU64::new(0),
                     saved: Mutex::new(None),
                     save_lock: Mutex::new(()),
+                    write_gate: Mutex::new(()),
+                    #[cfg(test)]
+                    slow_save: Mutex::new(Duration::ZERO),
                 })
             })
             .collect();
@@ -624,6 +648,33 @@ impl Engine {
             }));
         }
         SearchResult { hits, total }
+    }
+
+    /// Ranked search across volumes: exact name, then name prefix, then
+    /// substring; shorter paths first within a class. `total` counts every
+    /// match. Paths are built under the volume lock, like `search`.
+    pub fn search_ranked(&self, query: &str, kind: Kind, limit: usize) -> SearchResult {
+        let mut cands: Vec<(u8, u32, usize, Hit)> = Vec::new();
+        let mut total = 0;
+        for (vi, v) in self.vols.iter().enumerate() {
+            let st = rd(&v.state);
+            let r = st.index.search_ranked(query, kind, limit);
+            total += r.total;
+            cands.extend(r.hits.iter().map(|h| {
+                let hit = Hit {
+                    volume: vi,
+                    path: st.index.path(h.entry),
+                    is_dir: st.index.is_dir(h.entry),
+                };
+                (h.class, h.path_len, vi, hit)
+            }));
+        }
+        cands.sort_by_key(|c| (c.0, c.1, c.2));
+        cands.truncate(limit);
+        SearchResult {
+            hits: cands.into_iter().map(|c| c.3).collect(),
+            total,
+        }
     }
 
     /// Stop the tail threads (and wait for them).
@@ -698,6 +749,7 @@ fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
                 } else {
                     let mut stats = ApplyStats::default();
                     {
+                        let _g = gate(&v.write_gate);
                         let mut st = wr(&v.state);
                         for c in &buf {
                             apply(&mut st.index, c, &mut stats);
@@ -712,6 +764,7 @@ fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
                         let t = Instant::now();
                         let fresh = rd(&v.state).index.compacted();
                         let dead = rd(&v.state).index.dead_len();
+                        let _g = gate(&v.write_gate);
                         wr(&v.state).index = fresh;
                         log(&format!(
                             "  {} compacted {} dead entries in {}",
@@ -734,10 +787,12 @@ fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
                 log(&format!("  {} journal reset or wrapped; rescanning in the background", v.label));
                 match full_scan(&**source, &v.label, log) {
                     Ok((fresh, usn, stats)) => {
+                        let g = gate(&v.write_gate);
                         let mut st = wr(&v.state);
                         *st = fresh;
                         v.next_usn.store(usn, Ordering::Release);
                         drop(st);
+                        drop(g);
                         // The snapshot on disk now belongs to a dead journal.
                         *v.saved.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         v.since_save.store(stats.total() as u64, Ordering::Relaxed);
@@ -1194,6 +1249,46 @@ mod tests {
         assert!(e.volumes()[0].applied >= 6);
         e.stop();
         assert!(!e.volumes()[0].live);
+    }
+
+    /// A snapshot write (a long read) while the tail has a change to apply
+    /// (a short write) used to queue the writer behind the reader and hold
+    /// every new query back until the snapshot finished.
+    #[test]
+    fn queries_never_wait_on_a_snapshot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::new("T1:");
+        let mut c = cfg(Some(dir.path()));
+        c.tail = true;
+        c.autosave = None;
+        let mut e = start(&[&fake], c);
+        *e.vols[0].slow_save.lock().unwrap() = Duration::from_millis(800);
+
+        let saver = {
+            let v = e.vols[0].clone();
+            thread::spawn(move || v.save().unwrap())
+        };
+        thread::sleep(Duration::from_millis(100)); // the save is now in its slow part
+        fake.create(40, 11, "during-save.txt", false);
+        thread::sleep(Duration::from_millis(100)); // the tail has hit the gate
+
+        let mut worst = Duration::ZERO;
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(400) {
+            let q = Instant::now();
+            assert_eq!(find(&e, "notes").len(), 1);
+            worst = worst.max(q.elapsed());
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(worst < Duration::from_millis(100), "a query waited {worst:?} on the snapshot");
+        // The change waits for the save, then lands.
+        saver.join().unwrap();
+        let t = Instant::now();
+        while find(&e, "during-save").is_empty() && t.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(find(&e, "during-save").len(), 1);
+        e.stop();
     }
 
     #[test]
