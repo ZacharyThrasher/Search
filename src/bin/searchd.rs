@@ -122,7 +122,7 @@ mod imp {
         }
 
         /// `title` is `searchd-<tag>`, so a test can find its own helper.
-        pub fn start(title: String, quit: Sender<()>) {
+        pub fn start(title: String, quit: Sender<()>, log: std::sync::Arc<super::Log>) {
             let _ = QUIT.set(Mutex::new(quit));
             let _ = std::thread::Builder::new().name("session-watch".into()).spawn(move || {
                 // SAFETY: plain window-class registration and a message loop on this thread.
@@ -162,6 +162,7 @@ mod imp {
                         null(),
                     );
                     if hwnd.is_null() {
+                        log.line("could not create the session window: no save when Windows logs off or Task Scheduler stops this");
                         return;
                     }
                     let mut msg: MSG = std::mem::zeroed();
@@ -318,6 +319,7 @@ mod imp {
         session::start(
             format!("searchd-{}", cli.pipe_tag.as_deref().unwrap_or("main")),
             quit_tx.clone(),
+            log.clone(),
         );
         let shared = Arc::new(Shared {
             engine: RwLock::new(None),
