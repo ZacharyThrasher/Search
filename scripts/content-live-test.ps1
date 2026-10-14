@@ -65,7 +65,7 @@ $bin = Join-Path $target 'release'
 # admin-write-only folder under Program Files, never in a folder a normal process could redirect
 # with a junction or link. The indexer is NOT elevated (see Start-Unelevated); its index lives in
 # the user's temp folder.
-if (Test-Path -LiteralPath $TestDir) { Log "refusing to use $TestDir: it already exists"; exit 1 }
+if (Test-Path -LiteralPath $TestDir) { Log "refusing to use ${TestDir}: it already exists"; exit 1 }
 $id = [guid]::NewGuid().ToString('N')
 $work = Join-Path $env:TEMP "search-content-live-$id"
 $helperDir = Join-Path (Join-Path $env:ProgramFiles 'Search') "livetest-$id"
