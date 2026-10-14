@@ -225,7 +225,9 @@ mod tests {
     use super::test_support::*;
     use super::*;
 
-    fn collect(buf: &[u8]) -> Result<(u64, Vec<(u64, u64, bool, String)>), ParseError> {
+    type Row = (u64, u64, bool, String);
+
+    fn collect(buf: &[u8]) -> Result<(u64, Vec<Row>), ParseError> {
         let mut v = Vec::new();
         let mut s = String::new();
         let next = parse_enum_buffer(buf, |e| {

@@ -462,7 +462,7 @@ impl Index {
             // Strictly increasing (each name is at least its NUL) and NUL-terminated.
             let bad = off
                 .par_windows(2)
-                .any(|w| w[1] <= w[0] || buf[w[1] as usize - 1] != 0);
+                .any(|w| w[1] <= w[0] || buf.get(w[1] as usize - 1) != Some(&0));
             if bad {
                 Err(format!("{what} offsets or terminators are corrupt"))
             } else {
@@ -1250,4 +1250,19 @@ mod tests {
             ix = ix.compacted();
         }
     }
+    #[test]
+    fn from_parts_rejects_offsets_past_the_buffer_without_panicking() {
+        let bad = OwnedParts {
+            lower: b"c:\0a\0".to_vec(),
+            orig: b"C:\0a\0".to_vec(),
+            lower_off: vec![0, 900, 5],
+            orig_off: vec![0, 3, 5],
+            parent: vec![NONE, 0],
+            rec: vec![5, 6],
+            flags: vec![FLAG_DIR | FLAG_ROOT, 0],
+            orphans: 0,
+        };
+        assert!(Index::from_parts(bad).is_err());
+    }
+
 }

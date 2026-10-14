@@ -263,6 +263,8 @@ struct Volume {
     since_save: AtomicU64,
     /// The snapshot on disk, if any.
     saved: Mutex<Option<Meta>>,
+    /// Serializes snapshot writes (they share one temp file).
+    save_lock: Mutex<()>,
 }
 
 fn rd<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -301,6 +303,7 @@ impl Volume {
         let Some(path) = self.snapshot_path() else {
             return Ok((0, Duration::ZERO));
         };
+        let _one_writer = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
         let t = Instant::now();
         let st = rd(&self.state);
         let meta = Meta::now(st.journal_id, self.next_usn.load(Ordering::Acquire));
@@ -402,6 +405,7 @@ fn open_volume(source: &Arc<dyn Source>, cfg: &Config) -> Result<Volume, SourceE
         applied: AtomicU64::new(since_save),
         since_save: AtomicU64::new(since_save),
         saved: Mutex::new(saved),
+        save_lock: Mutex::new(()),
     };
 
     let journal = match source.journal() {
@@ -550,6 +554,7 @@ impl Engine {
                     applied: AtomicU64::new(0),
                     since_save: AtomicU64::new(0),
                     saved: Mutex::new(None),
+                    save_lock: Mutex::new(()),
                 })
             })
             .collect();
