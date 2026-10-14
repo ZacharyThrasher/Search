@@ -204,6 +204,11 @@ enum Msg {
     Remove(String),
     RemoveFid(u64),
     RemoveFolder(String),
+    /// Crawl this folder, but only after everything queued before this message
+    /// (a folder removal in particular) is committed and the manifest reloaded:
+    /// otherwise the crawl would trust manifest entries for files just removed
+    /// and skip them (a folder renamed away and straight back).
+    WalkAfterCommit(String),
     /// Commit now and reply when done.
     Barrier(SyncSender<()>),
 }
@@ -525,6 +530,7 @@ fn writer_loop(sh: Arc<Shared>, first: store::Writer, rx: Receiver<Msg>) {
     };
     passages(&reader);
     let mut acks: Vec<SyncSender<()>> = Vec::new();
+    let mut walks: Vec<String> = Vec::new();
     loop {
         let got = rx.recv_timeout(Duration::from_millis(500));
         if got.is_ok() {
@@ -561,6 +567,7 @@ fn writer_loop(sh: Arc<Shared>, first: store::Writer, rx: Receiver<Msg>) {
                 }
                 reload_manifest = true;
             }
+            Ok(Msg::WalkAfterCommit(d)) => walks.push(d),
             Ok(Msg::Barrier(ack)) => acks.push(ack),
             Err(RecvTimeoutError::Timeout) => {
                 if sh.stopping() {
@@ -573,8 +580,9 @@ fn writer_loop(sh: Arc<Shared>, first: store::Writer, rx: Receiver<Msg>) {
             && (w.pending >= 20_000
                 || last_commit.elapsed() >= sh.opts.commit_every
                 || last_msg.elapsed() >= Duration::from_millis(1500)
-                || !acks.is_empty());
-        if !due && !(!acks.is_empty() && w.pending == 0) {
+                || !acks.is_empty()
+                || !walks.is_empty());
+        if !due && !((!acks.is_empty() || !walks.is_empty()) && w.pending == 0) {
             continue;
         }
         match w.commit() {
@@ -622,6 +630,9 @@ fn writer_loop(sh: Arc<Shared>, first: store::Writer, rx: Receiver<Msg>) {
         passages(&reader);
         for a in acks.drain(..) {
             let _ = a.send(());
+        }
+        for d in walks.drain(..) {
+            sh.request_walk(d);
         }
     }
     // Commit what is left. Merges still running are abandoned (the index stays
@@ -863,7 +874,7 @@ impl Shared {
                 (EventKind::Renamed, true) => {
                     self.send(Msg::RemoveFolder(e.old_path));
                     if self.rules.allows_dir(&e.path) {
-                        self.request_walk(e.path);
+                        self.send(Msg::WalkAfterCommit(e.path));
                     }
                 }
                 (EventKind::Changed, true) => {
