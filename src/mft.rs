@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Ioctl::{
 use crate::fmt::{commas, dur, mib};
 use crate::index::{Builder, Index};
 use crate::live::{Change, JournalInfo, ReadError, Scan, Source, SourceError};
-use crate::usn::{FRN_RECORD_MASK, REASON_MASK, parse_enum_buffer, parse_journal_buffer};
+use crate::usn::{FRN_RECORD_MASK, REASON_DATA_MASK, REASON_MASK, parse_enum_buffer, parse_journal_buffer};
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const DRIVE_FIXED: u32 = 3;
@@ -427,6 +427,8 @@ fn query_journal(vol: &Volume) -> io::Result<JournalInfo> {
 pub struct NtfsSource {
     letter: char,
     threads: usize,
+    /// Also read the records of data writes (set while the indexer listens).
+    data_events: std::sync::atomic::AtomicBool,
     handle: Mutex<Option<Arc<Volume>>>,
     buf: Mutex<Vec<u8>>,
 }
@@ -436,6 +438,7 @@ impl NtfsSource {
         NtfsSource {
             letter: letter.to_ascii_uppercase(),
             threads,
+            data_events: std::sync::atomic::AtomicBool::new(false),
             handle: Mutex::new(None),
             buf: Mutex::new(Vec::new()),
         }
@@ -498,11 +501,20 @@ impl Source for NtfsSource {
         Ok(Scan { index, detail })
     }
 
+    fn set_data_events(&self, on: bool) {
+        self.data_events.store(on, std::sync::atomic::Ordering::Release);
+    }
+
     fn read(&self, journal_id: u64, from: i64, out: &mut Vec<Change>) -> Result<i64, ReadError> {
         let vol = self.volume().map_err(ReadError::Io)?;
+        let mask = if self.data_events.load(std::sync::atomic::Ordering::Acquire) {
+            REASON_MASK | REASON_DATA_MASK
+        } else {
+            REASON_MASK
+        };
         let input = ReadUsnJournalData {
             start_usn: from,
-            reason_mask: REASON_MASK,
+            reason_mask: mask,
             return_only_on_close: 0,
             timeout: 0,
             bytes_to_wait_for: 0, // never block: the engine polls
@@ -543,7 +555,7 @@ impl Source for NtfsSource {
         }
         let mut name = String::new();
         parse_journal_buffer(&buf[..ret as usize], |e| {
-            if e.reason & REASON_MASK == 0 {
+            if e.reason & mask == 0 {
                 return;
             }
             e.decode_name(&mut name);

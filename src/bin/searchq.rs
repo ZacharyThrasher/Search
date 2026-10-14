@@ -45,10 +45,19 @@ fn main() -> std::process::ExitCode {
         /// Seconds to wait for the helper to appear and finish loading.
         #[arg(long, default_value_t = 0)]
         wait: u64,
+        /// Search file contents (the index `searchi` keeps) instead of names.
+        #[arg(long)]
+        content: bool,
+        /// Content index folder (default: %LOCALAPPDATA%\Search\content).
+        #[arg(long)]
+        content_dir: Option<std::path::PathBuf>,
     }
 
     search::sys::quiet_errors();
     let cli = Cli::parse();
+    if cli.content {
+        return content_query(&cli.query.join(" "), cli.content_dir.clone(), cli.limit as usize, cli.bench);
+    }
     let name = match pipe::pipe_name(cli.pipe_tag.as_deref()) {
         Ok(n) => n,
         Err(e) => {
@@ -119,6 +128,10 @@ fn main() -> std::process::ExitCode {
             eprintln!("error: {e}");
             return ExitCode::from(6);
         }
+        _ => {
+            eprintln!("unexpected reply");
+            return ExitCode::from(6);
+        }
     }
 
     if let Some(n) = cli.bench {
@@ -140,6 +153,56 @@ fn main() -> std::process::ExitCode {
             dur(p(0.95)),
             dur(*times.last().unwrap())
         );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `searchq --content words`: query the content index directly and time it.
+#[cfg(windows)]
+fn content_query(
+    text: &str,
+    dir: Option<std::path::PathBuf>,
+    limit: usize,
+    bench: Option<usize>,
+) -> std::process::ExitCode {
+    use search::content::{config, search::ContentReader, status};
+    use search::fmt::dur;
+    use std::process::ExitCode;
+    use std::time::Instant;
+
+    let dir = dir.unwrap_or_else(config::content_dir);
+    let t = Instant::now();
+    let reader = match ContentReader::open(&dir) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("no content index in {} ({e}); is searchi running?", dir.display());
+            return ExitCode::from(3);
+        }
+    };
+    let opened = t.elapsed();
+    if let Some(p) = status::read(&dir) {
+        println!("{}", p.summary(status::now_ms()));
+    }
+    let t = Instant::now();
+    let hits = reader.search(text, limit);
+    let first = t.elapsed();
+    for h in &hits {
+        let loc = if h.page > 0 { format!(" (page {})", h.page) } else { String::new() };
+        println!("{:7.2}  {}{loc}
+         {}", h.score, h.path, h.snippet);
+    }
+    println!("{} files, first query {} (open {}), {} passages", hits.len(), dur(first), dur(opened), reader.passages());
+    if let Some(n) = bench {
+        let mut times: Vec<std::time::Duration> = (0..n)
+            .map(|_| {
+                let t = Instant::now();
+                let _ = reader.search(text, limit);
+                t.elapsed()
+            })
+            .collect();
+        times.sort();
+        let p = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
+        println!("over {n} runs: min {}  p50 {}  p95 {}  max {}", dur(times[0]), dur(p(0.5)), dur(p(0.95)), dur(*times.last().unwrap()));
     }
     ExitCode::SUCCESS
 }

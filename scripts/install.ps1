@@ -19,6 +19,11 @@
         %LOCALAPPDATA%\Programs\Search\ and started at logon via
         HKCU\...\Run.
 
+    searchi.exe  (normal)     the content indexer: reads files (in child processes
+        of its own) and keeps the content index in %LOCALAPPDATA%\Search\content.
+        Never elevated; it is copied next to the popup and started at logon via
+        HKCU\...\Run too. It indexes at low priority and pauses while you work.
+
   To update after a rebuild, run this script again (it stops both programs,
   replaces the files, and restarts them). Remove everything with uninstall.ps1.
   The helper keeps its snapshots and log in C:\Program Files\Search\data (admin-write
@@ -107,16 +112,22 @@ try {
         Pop-Location
         if ($rc -ne 0) { throw 'build failed' }
     }
-    foreach ($f in 'searchd.exe', 'searchq.exe', 'searchpop.exe') {
+    foreach ($f in 'searchd.exe', 'searchq.exe', 'searchpop.exe', 'searchi.exe') {
         if (-not (Test-Path (Join-Path $release $f))) { throw "$f not found in $release (build first)" }
     }
 
-    # Popup: stop, copy, autostart, start.
-    Get-Process searchpop -ErrorAction SilentlyContinue | Stop-Process -Force
+    # Popup and indexer: stop, copy, autostart, start. (The indexer's children are
+    # searchi processes too, so stopping by name ends them all.)
+    $indexerExe = Join-Path $popDir 'searchi.exe'
+    if (Test-Path $indexerExe) { & $indexerExe --stop | Out-Null; Start-Sleep -Milliseconds 1500 }
+    Get-Process searchpop, searchi -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Milliseconds 300
     New-Item -ItemType Directory -Force $popDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $release 'searchpop.exe') -Destination (Join-Path $popDir 'searchpop.exe') -Force
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'SearchPopup' -Value ('"{0}"' -f (Join-Path $popDir 'searchpop.exe'))
+    Copy-Item -LiteralPath (Join-Path $release 'searchi.exe') -Destination $indexerExe -Force
+    $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    Set-ItemProperty -Path $run -Name 'SearchPopup' -Value ('"{0}"' -f (Join-Path $popDir 'searchpop.exe'))
+    Set-ItemProperty -Path $run -Name 'SearchIndexer' -Value ('"{0}"' -f $indexerExe)
 
     # Helper: one UAC prompt.
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-HelperStep',
@@ -125,9 +136,12 @@ try {
     if ($p.ExitCode -ne 0) { throw 'the helper step did not finish (was the UAC prompt declined?)' }
 
     Start-Process -FilePath (Join-Path $popDir 'searchpop.exe')
+    Start-Process -FilePath $indexerExe -WindowStyle Hidden
     Write-Host ''
     Write-Host 'Done. Press Alt+Space (change it in %LOCALAPPDATA%\Search\config.toml).'
     Write-Host 'First start scans the drives once (about 10-30 s); the popup says so until it is ready.'
+    Write-Host 'File contents are indexed in the background (low priority, only while you are away);'
+    Write-Host 'the tray icon tooltip shows how far it is. Settings: the [content] section of config.toml.'
 } catch {
     Write-Host "SETUP FAILED: $($_.Exception.Message)" -ForegroundColor Red
 }

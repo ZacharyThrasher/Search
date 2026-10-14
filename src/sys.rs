@@ -97,6 +97,11 @@ pub fn attach_parent_console() -> bool {
     };
     // SAFETY: plain console calls; the CONOUT$ handle is intentionally kept for the life of the process.
     unsafe {
+        // Output already redirected to a file or pipe: leave it alone.
+        let out = windows_sys::Win32::System::Console::GetStdHandle(STD_OUTPUT_HANDLE);
+        if !out.is_null() && out != INVALID_HANDLE_VALUE {
+            return true;
+        }
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             return false;
         }

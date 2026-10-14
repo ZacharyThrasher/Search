@@ -35,7 +35,7 @@ mod imp {
     use search::fmt::{commas, dur};
     use search::index::Kind;
     use search::ipc::{self, HitMsg, KindFilter, Reply, Request, StatusMsg};
-    use search::live::{Config, Engine, FailureKind, SavePolicy};
+    use search::live::{Config, Engine, FailureKind, ListPage, SavePolicy};
     use search::mft::{self, NtfsSource};
     use search::{pipe, sys};
 
@@ -284,6 +284,33 @@ mod imp {
                             .collect(),
                     }
                 }
+                Request::Subscribe(filter) => match self.engine() {
+                    Some(e) => {
+                        let (epoch, next) = e.subscribe(filter);
+                        Reply::Subscribed { epoch, next }
+                    }
+                    None => Reply::Loading(self.progress.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+                },
+                Request::Events { epoch, next, max, wait_ms } => match self.engine() {
+                    Some(e) => {
+                        let wait = Duration::from_millis(wait_ms.min(ipc::MAX_EVENT_WAIT_MS) as u64);
+                        let p = e.events().poll(epoch, next, max as usize, wait);
+                        Reply::Events {
+                            state: p.state,
+                            epoch: p.epoch,
+                            next: p.next,
+                            events: p.events,
+                        }
+                    }
+                    None => Reply::Loading(self.progress.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+                },
+                Request::ListFiles { cursor, filter } => match self.engine() {
+                    Some(e) => match e.list_files(cursor, &filter) {
+                        ListPage::Page { paths, next } => Reply::Files { restart: false, next, paths },
+                        ListPage::Restart => Reply::Files { restart: true, next: None, paths: Vec::new() },
+                    },
+                    None => Reply::Loading(self.progress.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+                },
                 Request::Save => match self.engine() {
                     Some(e) => {
                         e.save(SavePolicy {

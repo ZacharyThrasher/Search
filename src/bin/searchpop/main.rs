@@ -14,9 +14,13 @@ fn main() {
 }
 
 #[cfg(windows)]
+mod content;
+#[cfg(windows)]
 mod icons;
 #[cfg(windows)]
 mod paint;
+#[cfg(windows)]
+mod preview;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
@@ -38,9 +42,11 @@ mod app {
     use std::ptr::{null, null_mut};
     use std::sync::{Arc, Mutex};
 
+    use search::content::config::{self as content_config, ContentConfig};
+    use search::content::status;
     use search::ipc::HitMsg;
     use search::pipe;
-    use search::popup::{Config, DEFAULT_CONFIG_FILE, ListView, Theme, parse_hotkey, split_path};
+    use search::popup::{Config, DEFAULT_CONFIG_FILE, ListView, Theme, parse_hotkey, split_path, step_across};
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Dwm::*;
     use windows_sys::Win32::Graphics::Gdi::*;
@@ -54,6 +60,7 @@ mod app {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+    use crate::content::{Answer as ContentAnswer, ContentRow, ContentWorker, Slot as ContentSlot};
     use crate::icons::Icons;
     use crate::paint::{Fonts, Palette};
     use crate::tray;
@@ -63,8 +70,12 @@ mod app {
     pub const WM_APP_ICON: u32 = WM_APP + 2;
     pub const WM_APP_TRAY: u32 = WM_APP + 3;
     pub const WM_APP_SHOW: u32 = WM_APP + 4;
+    pub const WM_APP_CONTENT: u32 = WM_APP + 5;
+    const TIMER_STATUS: usize = 1;
 
-    const CLASS: &str = "SearchPopupWindow";
+    fn class_name() -> String {
+        if dev_dir().is_some() { "SearchPopupWindowDev".into() } else { "SearchPopupWindow".into() }
+    }
     const HOTKEY_ID: i32 = 1;
     const IDM_SHOW: usize = 1;
     const IDM_CONFIG: usize = 2;
@@ -88,6 +99,16 @@ mod app {
         Message(String),
     }
 
+    /// Which list the selection is in.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Focus {
+        Names,
+        Content,
+    }
+
+    /// Content rows shown at once (the rest scroll).
+    const CONTENT_ROWS: usize = 3;
+
     /// Pixel geometry for the current DPI and state.
     pub struct Layout {
         pub dpi: u32,
@@ -95,8 +116,15 @@ mod app {
         pub h: i32,
         pub pad: i32,
         pub input_h: i32,
+        /// Top of the name rows; the whole list region (names + content) is `list_h` tall.
         pub list_y: i32,
         pub list_h: i32,
+        /// Height of the name rows (0 when there are none).
+        pub names_h: i32,
+        /// Top of the "In files" caption, of its first row, and its total height (0: no section).
+        pub content_y: i32,
+        pub content_rows_y: i32,
+        pub content_h: i32,
         pub row_h: i32,
         pub footer_y: i32,
         pub footer_h: i32,
@@ -125,6 +153,20 @@ mod app {
         pub total: u64,
         pub list: ListView,
         pub mode: Mode,
+        /// Matches inside files, shown below the names.
+        pub content: Vec<ContentRow>,
+        pub content_list: ListView,
+        pub focus: Focus,
+        /// The content index is still being built, so the list may be incomplete.
+        pub content_indexing: bool,
+        content_worker: Option<ContentWorker>,
+        content_slot: ContentSlot,
+        /// A content search for the current text has not answered yet.
+        content_pending: bool,
+        /// The name search for the current text has answered.
+        names_done: bool,
+        content_dir: PathBuf,
+        status_line: String,
         worker: Worker,
         slot: Slot,
         pub icons: Icons,
@@ -140,10 +182,18 @@ mod app {
         }
     }
 
+    /// Development: run a second popup beside the installed one, with its own
+    /// settings, helper pipe and content index.
+    fn dev_dir() -> Option<PathBuf> {
+        std::env::var_os("SEARCHPOP_DATA_DIR").map(PathBuf::from)
+    }
+
     fn data_dir() -> PathBuf {
-        let d = std::env::var_os("LOCALAPPDATA")
-            .map(|d| PathBuf::from(d).join("Search"))
-            .unwrap_or_else(|| std::env::temp_dir().join("Search"));
+        let d = dev_dir().unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(|d| PathBuf::from(d).join("Search"))
+                .unwrap_or_else(|| std::env::temp_dir().join("Search"))
+        });
         let _ = std::fs::create_dir_all(&d);
         d
     }
@@ -184,9 +234,11 @@ mod app {
             CoInitializeEx(null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32);
 
             // One popup per user session: a second start just shows the first.
-            let m = CreateMutexW(null(), 0, wide("Local\\SearchPopupSingleton").as_ptr());
+            let dev = dev_dir().is_some();
+            let mutex = if dev { "Local\\SearchPopupSingletonDev" } else { "Local\\SearchPopupSingleton" };
+            let m = CreateMutexW(null(), 0, wide(mutex).as_ptr());
             if m.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
-                let other = FindWindowW(wide(CLASS).as_ptr(), null());
+                let other = FindWindowW(wide(&class_name()).as_ptr(), null());
                 if !other.is_null() {
                     PostMessageW(other, WM_APP_SHOW, 0, 0);
                 }
@@ -196,13 +248,13 @@ mod app {
 
         let config_path = dir.join("config.toml");
         if !config_path.exists() {
-            let _ = std::fs::write(&config_path, DEFAULT_CONFIG_FILE);
+            let _ = std::fs::write(&config_path, format!("{DEFAULT_CONFIG_FILE}{}", content_config::DEFAULT_SECTION));
         }
-        let (cfg, problems) = match std::fs::read_to_string(&config_path) {
-            Ok(t) => Config::parse(&t),
-            Err(_) => (Config::default(), Vec::new()),
-        };
-        for p in &problems {
+        let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+        let (cfg, problems) = Config::parse(&config_text);
+        let (content_cfg, content_problems) = ContentConfig::parse(&config_text);
+        let content_problems = if config_text.is_empty() { Vec::new() } else { content_problems };
+        for p in problems.iter().chain(&content_problems) {
             log(&log_path, &format!("config: {p}"));
         }
 
@@ -210,7 +262,7 @@ mod app {
         // leaked into GWLP_USERDATA and lives as long as the window.
         unsafe {
             let hinst = GetModuleHandleW(null());
-            let class_name = wide(CLASS);
+            let class_name = wide(&class_name());
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 style: CS_DBLCLKS,
@@ -268,8 +320,16 @@ mod app {
             );
 
             let slot: Slot = Arc::new(Mutex::new(None));
-            let pipe_name = pipe::pipe_name(None).unwrap_or_default();
+            let pipe_tag = std::env::var("SEARCHPOP_PIPE_TAG").ok();
+            let pipe_name = pipe::pipe_name(pipe_tag.as_deref()).unwrap_or_default();
             let worker = Worker::start(hwnd, slot.clone(), pipe_name);
+            let content_dir = std::env::var_os("SEARCHPOP_CONTENT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(content_config::content_dir);
+            let content_slot: ContentSlot = Arc::new(Mutex::new(None));
+            let content_worker = content_cfg
+                .enabled
+                .then(|| ContentWorker::start(hwnd, content_slot.clone(), content_dir.clone(), content_cfg.max_results));
             let icons = Icons::start(hwnd);
             let hk = match parse_hotkey(&cfg.hotkey) {
                 Ok(h) => h,
@@ -296,6 +356,16 @@ mod app {
                 rows: Vec::new(),
                 total: 0,
                 mode: Mode::Idle,
+                content: Vec::new(),
+                content_list: ListView { visible: CONTENT_ROWS, ..Default::default() },
+                focus: Focus::Names,
+                content_indexing: false,
+                content_worker,
+                content_slot,
+                content_pending: false,
+                names_done: false,
+                content_dir,
+                status_line: String::new(),
                 worker,
                 slot,
                 icons,
@@ -320,8 +390,18 @@ mod app {
                 log(&log_path, &msg);
                 app.hotkey_label = format!("{} (unavailable: in use)", cfg.hotkey);
             }
+            if let Some(i) = std::env::args().position(|a| a == "--preview") {
+                // Development: paint a sample result list to a bitmap file and exit.
+                let out = std::env::args().nth(i + 1).unwrap_or_else(|| "preview.bmp".into());
+                app.preview(&out);
+                return;
+            }
+            app.refresh_status(false);
             tray::add(hwnd, &app.tray_tip(), dark);
             app.worker.send(Job::Warm);
+            if app.content_worker.is_some() {
+                SetTimer(hwnd, TIMER_STATUS, 5000, None);
+            }
 
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -357,7 +437,28 @@ mod app {
         }
 
         fn tray_tip(&self) -> String {
-            format!("Search ({})", self.hotkey_label)
+            if self.status_line.is_empty() {
+                format!("Search ({})", self.hotkey_label)
+            } else {
+                format!("Search ({})\n{}", self.hotkey_label, self.status_line)
+            }
+        }
+
+        /// Re-read the indexer's progress file; update the tray tooltip if it changed.
+        fn refresh_status(&mut self, update_tray: bool) {
+            if self.content_worker.is_none() {
+                return;
+            }
+            let line = match status::read(&self.content_dir) {
+                Some(p) => p.summary(status::now_ms()),
+                None => "Content search: indexer not started yet".to_string(),
+            };
+            if line != self.status_line {
+                self.status_line = line;
+                if update_tray {
+                    tray::set_tip(self.hwnd, &self.tray_tip());
+                }
+            }
         }
 
         fn apply_font(&self) {
@@ -368,6 +469,8 @@ mod app {
         fn rows_shown(&self) -> usize {
             match self.mode {
                 Mode::Results => self.rows.len().min(self.cfg.visible_rows),
+                // The "no results" line gives way to the content section.
+                Mode::Message(_) if !self.content.is_empty() => 0,
                 Mode::Message(_) => 1,
                 Mode::Idle => 0,
             }
@@ -380,16 +483,25 @@ mod app {
             let row_h = s(52);
             let footer_h = s(28);
             let rows = self.rows_shown() as i32;
-            let list_h = if rows > 0 { rows * row_h + s(4) } else { 0 };
-            let footer = if rows > 0 { footer_h } else { 0 };
+            let names_h = if rows > 0 { rows * row_h + s(4) } else { 0 };
+            let crows = if matches!(self.mode, Mode::Idle) { 0 } else { self.content.len().min(CONTENT_ROWS) as i32 };
+            let head_h = if crows > 0 { s(24) } else { 0 };
+            let content_h = if crows > 0 { head_h + crows * row_h + s(4) } else { 0 };
+            let list_h = names_h + content_h;
+            let footer = if list_h > 0 { footer_h } else { 0 };
+            let list_y = input_h + 1 + s(2);
             Layout {
                 dpi: self.dpi,
                 w,
-                h: input_h + if rows > 0 { 1 } else { 0 } + list_h + footer,
+                h: input_h + if list_h > 0 { 1 } else { 0 } + list_h + footer,
                 pad: s(16),
                 input_h,
-                list_y: input_h + 1 + s(2),
+                list_y,
                 list_h,
+                names_h,
+                content_y: input_h + 1 + names_h,
+                content_rows_y: input_h + 1 + names_h + head_h,
+                content_h,
                 row_h,
                 footer_y: input_h + 1 + list_h,
                 footer_h: footer,
@@ -400,6 +512,7 @@ mod app {
         pub fn layout_and_resize(&mut self, keep_pos: bool) {
             let lay = self.layout();
             self.list.visible = self.cfg.visible_rows.min(self.rows.len().max(1));
+            self.content_list.visible = CONTENT_ROWS.min(self.content.len().max(1));
             // SAFETY: valid window handles; the DC is released.
             unsafe {
                 let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
@@ -470,6 +583,7 @@ mod app {
                 self.total = 0;
                 self.mode = Mode::Idle;
                 self.list.reset(0);
+                self.clear_content();
                 self.worker.send(Job::Query {
                     seq: self.seq,
                     text: String::new(),
@@ -549,10 +663,12 @@ mod app {
             }
             self.query = text;
             self.seq += 1;
+            self.names_done = false;
             if self.query.trim().is_empty() {
                 self.rows.clear();
                 self.mode = Mode::Idle;
                 self.list.reset(0);
+                self.clear_content();
                 self.layout_and_resize(true);
             }
             self.worker.send(Job::Query {
@@ -560,6 +676,62 @@ mod app {
                 text: self.query.clone(),
                 limit: self.cfg.max_results as u16,
             });
+            // Content results follow on their own thread; the ones already on
+            // screen stay until the new answer replaces them.
+            if let Some(cw) = &self.content_worker {
+                self.content_pending = !self.query.trim().is_empty();
+                cw.send(self.seq, self.query.clone());
+            }
+        }
+
+        fn clear_content(&mut self) {
+            self.content.clear();
+            self.content_list.reset(0);
+            self.content_pending = false;
+            self.focus = Focus::Names;
+            if let Some(cw) = &self.content_worker {
+                // Forget the previous query (and cancel anything in flight).
+                cw.send(self.seq, String::new());
+            }
+        }
+
+        /// Show "No results" only once neither search has anything to show.
+        fn settle_empty(&mut self) {
+            if self.names_done
+                && !self.content_pending
+                && self.rows.is_empty()
+                && self.content.is_empty()
+                && !self.query.trim().is_empty()
+                && !matches!(self.mode, Mode::Message(_))
+            {
+                self.mode = Mode::Message(format!("No results for \u{201C}{}\u{201D}", self.query.trim()));
+            }
+        }
+
+        fn take_content(&mut self) {
+            let ans: Option<ContentAnswer> = self.content_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some(ContentAnswer { seq, rows, still_indexing }) = ans else { return };
+            if seq != self.seq || self.query.trim().is_empty() {
+                return; // an older query's answer
+            }
+            self.content_pending = false;
+            self.content_indexing = still_indexing;
+            let same = self.content.len() == rows.len()
+                && self.content.iter().zip(&rows).all(|(a, b)| a.path == b.path);
+            self.content = rows;
+            if !same {
+                self.content_list.reset(self.content.len());
+            }
+            self.content_list.visible = CONTENT_ROWS.min(self.content.len().max(1));
+            if self.content.is_empty() && self.focus == Focus::Content {
+                self.focus = Focus::Names;
+            }
+            // Nothing among the names: the content hits take the selection.
+            if self.rows.is_empty() && !self.content.is_empty() {
+                self.focus = Focus::Content;
+            }
+            self.settle_empty();
+            self.layout_and_resize(true);
         }
 
         fn take_answer(&mut self) {
@@ -568,16 +740,24 @@ mod app {
             if seq != self.seq || self.query.trim().is_empty() {
                 return; // an older query's answer
             }
+            self.names_done = true;
             match outcome {
                 Outcome::Hits { total, hits } => {
                     self.total = total;
                     let keep = self.rows.first().map(|r| r.path.clone());
                     self.rows = hits.into_iter().map(|HitMsg { path, is_dir }| Row { path, is_dir }).collect();
                     if self.rows.is_empty() {
-                        self.mode = Mode::Message(format!("No results for \u{201C}{}\u{201D}", self.query.trim()));
+                        // No names: the content section (if any) fills the list. "No results"
+                        // appears only when the content search has nothing either.
+                        self.mode = Mode::Results;
                         self.list.reset(0);
+                        if !self.content.is_empty() {
+                            self.focus = Focus::Content;
+                        }
+                        self.settle_empty();
                     } else {
                         self.mode = Mode::Results;
+                        self.focus = Focus::Names;
                         // Keep the selection on top while typing; only reset when the list changed.
                         if keep.as_deref() != self.rows.first().map(|r| r.path.as_str()) || self.list.len != self.rows.len() {
                             self.list.reset(self.rows.len());
@@ -600,9 +780,16 @@ mod app {
         }
 
         fn selected_path(&self) -> Option<&str> {
-            matches!(self.mode, Mode::Results)
-                .then(|| self.rows.get(self.list.selected).map(|r| r.path.as_str()))
-                .flatten()
+            if !matches!(self.mode, Mode::Results | Mode::Message(_)) {
+                return None;
+            }
+            match self.focus {
+                Focus::Content => self.content.get(self.content_list.selected).map(|r| r.path.as_str()),
+                Focus::Names if matches!(self.mode, Mode::Results) => {
+                    self.rows.get(self.list.selected).map(|r| r.path.as_str())
+                }
+                Focus::Names => None,
+            }
         }
 
         fn refuse(&mut self, msg: String) {
@@ -653,20 +840,50 @@ mod app {
             self.hide();
         }
 
+        /// Move the selection through the name rows and on into the content rows.
         fn step(&mut self, delta: isize) {
-            self.list.step(delta);
+            let names = if matches!(self.mode, Mode::Results) { self.rows.len() } else { 0 };
+            let at = match self.focus {
+                Focus::Names => (false, self.list.selected),
+                Focus::Content => (true, self.content_list.selected),
+            };
+            match step_across(names, self.content.len(), at, delta) {
+                (false, i) => {
+                    self.focus = Focus::Names;
+                    self.list.select(i);
+                }
+                (true, i) => {
+                    self.focus = Focus::Content;
+                    self.content_list.select(i);
+                }
+            }
             // SAFETY: invalidating our window.
             unsafe { InvalidateRect(self.hwnd, null(), 0) };
         }
 
-        fn row_at(&self, y: i32) -> Option<usize> {
+        fn page(&mut self, dir: isize) {
+            match self.focus {
+                Focus::Names => self.list.page(dir),
+                Focus::Content => self.content_list.page(dir),
+            }
+            // SAFETY: invalidating our window.
+            unsafe { InvalidateRect(self.hwnd, null(), 0) };
+        }
+
+        /// The row under pixel row `y`, in whichever list it is.
+        fn row_at(&self, y: i32) -> Option<(Focus, usize)> {
             let lay = self.layout();
-            if !matches!(self.mode, Mode::Results) || y < lay.list_y {
+            if y >= lay.content_rows_y && lay.content_h > 0 {
+                let slot = ((y - lay.content_rows_y) / lay.row_h) as usize;
+                let i = self.content_list.top + slot;
+                return (slot < self.content_list.visible && i < self.content.len()).then_some((Focus::Content, i));
+            }
+            if !matches!(self.mode, Mode::Results) || y < lay.list_y || y >= lay.list_y + lay.names_h {
                 return None;
             }
             let slot = ((y - lay.list_y) / lay.row_h) as usize;
             let i = self.list.top + slot;
-            (slot < self.list.visible && i < self.rows.len()).then_some(i)
+            (slot < self.list.visible && i < self.rows.len()).then_some((Focus::Names, i))
         }
 
         fn show_menu(&mut self) {
@@ -755,6 +972,14 @@ mod app {
                     app.take_answer();
                     0
                 }
+                WM_APP_CONTENT => {
+                    app.take_content();
+                    0
+                }
+                WM_TIMER if wp == TIMER_STATUS => {
+                    app.refresh_status(true);
+                    0
+                }
                 WM_APP_ICON => {
                     InvalidateRect(hwnd, null(), 0);
                     0
@@ -796,8 +1021,12 @@ mod app {
                 }
                 WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                     let y = ((lp >> 16) & 0xFFFF) as i16 as i32;
-                    if let Some(i) = app.row_at(y) {
-                        app.list.select(i);
+                    if let Some((focus, i)) = app.row_at(y) {
+                        app.focus = focus;
+                        match focus {
+                            Focus::Names => app.list.select(i),
+                            Focus::Content => app.content_list.select(i),
+                        }
                         InvalidateRect(hwnd, null(), 0);
                         if msg == WM_LBUTTONDBLCLK {
                             app.open_selected();
@@ -807,7 +1036,16 @@ mod app {
                 }
                 WM_MOUSEWHEEL => {
                     let delta = ((wp >> 16) & 0xFFFF) as i16 as i32;
-                    app.list.scroll(if delta > 0 { -3 } else { 3 });
+                    // The wheel position is in screen coordinates.
+                    let mut p = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+                    ScreenToClient(hwnd, &mut p);
+                    let lay = app.layout();
+                    let step = if delta > 0 { -3 } else { 3 };
+                    if lay.content_h > 0 && p.y >= lay.content_y {
+                        app.content_list.scroll(step);
+                    } else {
+                        app.list.scroll(step);
+                    }
                     InvalidateRect(hwnd, null(), 0);
                     0
                 }
@@ -895,8 +1133,7 @@ mod app {
                             return 0;
                         }
                         VK_PRIOR | VK_NEXT => {
-                            app.list.page(if vk == VK_NEXT { 1 } else { -1 });
-                            InvalidateRect(app.hwnd, null(), 0);
+                            app.page(if vk == VK_NEXT { 1 } else { -1 });
                             return 0;
                         }
                         VK_RETURN => {

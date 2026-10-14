@@ -1,6 +1,8 @@
 //! Search core: an in-RAM filename index built from the NTFS master file
 //! table (or, as a fallback, a directory walk) and a fast substring scan.
 
+pub mod events;
+pub mod content;
 pub mod fmt;
 pub mod index;
 pub mod ipc;
