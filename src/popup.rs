@@ -157,6 +157,11 @@ impl Config {
             if line.is_empty() {
                 continue;
             }
+            // The popup's keys come first; sections such as [content] belong to
+            // other programs (see `content::config`).
+            if line.starts_with('[') {
+                break;
+            }
             let Some((k, v)) = line.split_once('=') else {
                 problems.push(format!("line {}: expected key = value", n + 1));
                 continue;
@@ -239,6 +244,19 @@ pub fn highlight_ranges(name: &str, query: &str) -> Vec<Range<usize>> {
             .map(|(_, q)| q.highlight(name))
             .unwrap_or_default()
     })
+}
+
+/// Move the selection through two lists shown one below the other (name rows,
+/// then content rows) as if they were one, wrapping at the ends. `at` is
+/// `(in_content, row)`; returns the new `(in_content, row)`.
+pub fn step_across(names: usize, content: usize, at: (bool, usize), delta: isize) -> (bool, usize) {
+    let total = names + content;
+    if total == 0 {
+        return at;
+    }
+    let here = if at.0 { names + at.1 } else { at.1 };
+    let g = (here as isize + delta).rem_euclid(total as isize) as usize;
+    if g < names { (false, g) } else { (true, g - names) }
 }
 
 /// Selection and scrolling over a list of `len` rows of which `visible` fit.
@@ -350,6 +368,13 @@ mod tests {
     }
 
     #[test]
+    fn sections_after_the_popup_keys_are_not_the_popups_business() {
+        let (c, p) = Config::parse("width = 700\n\n[content]\nenabled = true\nextensions = [\"pdf\",\n  \"txt\"]\nwho = 1\n");
+        assert!(p.is_empty(), "{p:?}");
+        assert_eq!(c.width, 700);
+    }
+
+    #[test]
     fn default_file_parses_to_defaults() {
         let (c, p) = Config::parse(DEFAULT_CONFIG_FILE);
         assert_eq!(c, Config::default());
@@ -378,6 +403,21 @@ mod tests {
         assert!(highlight_ranges("İstanbul", "stan").is_empty());
         // Same total length but shifted boundaries ('Ⱥ' 2->3 bytes, 'Ɱ' 3->2): must not panic.
         assert!(highlight_ranges("\u{23A}\u{2C6E}", "\u{271}").is_empty());
+    }
+
+    #[test]
+    fn selection_flows_from_names_into_content_and_wraps() {
+        // 2 names, 3 content rows.
+        assert_eq!(step_across(2, 3, (false, 0), 1), (false, 1));
+        assert_eq!(step_across(2, 3, (false, 1), 1), (true, 0));
+        assert_eq!(step_across(2, 3, (true, 2), 1), (false, 0)); // wraps to the top
+        assert_eq!(step_across(2, 3, (false, 0), -1), (true, 2)); // and back to the bottom
+        assert_eq!(step_across(2, 3, (true, 0), -1), (false, 1));
+        // Only one kind present.
+        assert_eq!(step_across(0, 3, (true, 2), 1), (true, 0));
+        assert_eq!(step_across(2, 0, (false, 1), 1), (false, 0));
+        // Nothing at all: stays put.
+        assert_eq!(step_across(0, 0, (false, 0), 1), (false, 0));
     }
 
     #[test]

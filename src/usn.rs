@@ -24,6 +24,14 @@ pub const REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
 /// Journal reads are filtered to these in the kernel, so data writes and
 /// attribute changes (the bulk of the traffic) never reach us.
 pub const REASON_MASK: u32 = REASON_FILE_CREATE | REASON_FILE_DELETE | REASON_RENAME_NEW_NAME;
+/// A file's contents changed. These records are the bulk of the journal's
+/// traffic, so they are only requested while the indexer is subscribed.
+pub const REASON_DATA_OVERWRITE: u32 = 0x0000_0001;
+pub const REASON_DATA_EXTEND: u32 = 0x0000_0002;
+pub const REASON_DATA_TRUNCATION: u32 = 0x0000_0004;
+pub const REASON_DATA_MASK: u32 = REASON_DATA_OVERWRITE | REASON_DATA_EXTEND | REASON_DATA_TRUNCATION;
+/// The last handle to the file was closed: the record is the file's final state.
+pub const REASON_CLOSE: u32 = 0x8000_0000;
 
 const HEADER_LEN: usize = 60; // fixed part of USN_RECORD_V2, up to the name
 const OFF_MAJOR: usize = 4;

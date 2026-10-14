@@ -111,6 +111,14 @@ pub fn add(hwnd: HWND, tip: &str, _dark: bool) {
     }
 }
 
+/// Change the tooltip of the existing icon.
+pub fn set_tip(hwnd: HWND, tip: &str) {
+    let mut nid = data(hwnd, tip);
+    nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+    // SAFETY: valid NOTIFYICONDATAW.
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+}
+
 pub fn remove(hwnd: HWND) {
     let nid = data(hwnd, "");
     // SAFETY: valid NOTIFYICONDATAW.

@@ -1063,6 +1063,11 @@ impl Index {
         self.flags[i as usize] & FLAG_DIR != 0
     }
 
+    /// The entry was removed (its slot stays until the index is compacted).
+    pub fn is_dead(&self, i: u32) -> bool {
+        self.flags[i as usize] & FLAG_DEAD != 0
+    }
+
     pub fn name(&self, i: u32) -> &str {
         std::str::from_utf8(self.orig_bytes(i as usize)).unwrap_or("")
     }

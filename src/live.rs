@@ -26,11 +26,15 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::events::{EventKind, EventLog, Filter};
 use crate::fmt::{age, commas, dur, mib};
 use crate::index::{Applied, Index, Kind, QueryOpts};
+use crate::ipc::{FILES_PAGE_BYTES, ListCursor, MAX_FILES_PER_PAGE};
 use crate::query::Query;
 use crate::snapshot::{self, LoadError, Meta};
-use crate::usn::{REASON_FILE_CREATE, REASON_FILE_DELETE, REASON_RENAME_NEW_NAME};
+use crate::usn::{
+    REASON_CLOSE, REASON_DATA_MASK, REASON_FILE_CREATE, REASON_FILE_DELETE, REASON_MASK, REASON_RENAME_NEW_NAME,
+};
 
 /// Where a volume's journal stands right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +112,9 @@ pub trait Source: Send + Sync {
     /// continue from. Returns `ReadError::Gone` if `journal_id` is not the
     /// active journal or `from` is no longer covered.
     fn read(&self, journal_id: u64, from: i64, out: &mut Vec<Change>) -> Result<i64, ReadError>;
+    /// Ask for (or stop asking for) the journal records of data writes, which
+    /// the content indexer needs and the name index does not. Default: ignore.
+    fn set_data_events(&self, _on: bool) {}
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +153,74 @@ pub fn apply(index: &mut Index, c: &Change, stats: &mut ApplyStats) {
         }
     } else {
         stats.ignored += 1;
+    }
+}
+
+/// Like `apply`, and also tell `log` what happened to the file (or folder),
+/// as far as `f` cares. Paths are built here, under the caller's lock, so
+/// they match the index at that moment; deleted and renamed entries are
+/// looked up *before* the change.
+pub fn apply_with_events(index: &mut Index, c: &Change, stats: &mut ApplyStats, f: &Filter, log: &EventLog) {
+    let wanted_name = |name: &str| c.is_dir || f.allows_name(name);
+    let wanted = |path: &str| if c.is_dir { f.allows_dir(path) } else { f.allows_file(path) };
+
+    if c.reason & REASON_FILE_DELETE != 0 {
+        let before = index.find_record(c.record).map(|i| index.path(i));
+        apply(index, c, stats);
+        if let Some(path) = before
+            && wanted_name(&c.name)
+            && wanted(&path)
+        {
+            log.push(EventKind::Deleted, c.is_dir, path, String::new());
+        }
+    } else if c.reason & REASON_RENAME_NEW_NAME != 0 {
+        let before = index.find_record(c.record).map(|i| (index.path(i), index.name(i).to_string()));
+        apply(index, c, stats);
+        let after = index.find_record(c.record).map(|i| index.path(i));
+        let Some(new) = after else { return };
+        let new_ok = wanted_name(&c.name) && wanted(&new);
+        match before {
+            Some((old, old_name)) => {
+                let old_ok = wanted_name(&old_name) && wanted(&old);
+                if old == new {
+                    // Same name again (a case change would differ); nothing to tell.
+                } else if old_ok && new_ok {
+                    log.push(EventKind::Renamed, c.is_dir, new, old);
+                } else if old_ok {
+                    log.push(EventKind::Deleted, c.is_dir, old, String::new());
+                } else if new_ok {
+                    log.push(EventKind::Changed, c.is_dir, new, String::new());
+                }
+            }
+            None if new_ok => log.push(EventKind::Changed, c.is_dir, new, String::new()),
+            None => {}
+        }
+        // A rename record can also carry the last close of a written file; the
+        // Changed/Renamed event above already covers it.
+    } else if c.reason & REASON_FILE_CREATE != 0 {
+        apply(index, c, stats);
+        // A folder's contents arrive as their own events. A file is reported
+        // once it is closed (before that it may be half written).
+        if !c.is_dir
+            && c.reason & REASON_CLOSE != 0
+            && wanted_name(&c.name)
+            && let Some(i) = index.find_record(c.record)
+        {
+            let path = index.path(i);
+            if wanted(&path) {
+                log.push(EventKind::Changed, false, path, String::new());
+            }
+        }
+    } else if c.reason & REASON_DATA_MASK != 0
+        && c.reason & REASON_CLOSE != 0
+        && !c.is_dir
+        && wanted_name(&c.name)
+        && let Some(i) = index.find_record(c.record)
+    {
+        let path = index.path(i);
+        if wanted(&path) {
+            log.push(EventKind::Changed, false, path, String::new());
+        }
     }
 }
 
@@ -199,6 +274,9 @@ pub struct Config {
     /// Rewrite snapshots on this cadence (subject to `SavePolicy`). `None` = only on request.
     pub autosave: Option<Duration>,
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Where change events for the content indexer are recorded. `None`: a
+    /// private log nobody reads (the engine always has one).
+    pub events: Option<Arc<EventLog>>,
 }
 
 impl Default for Config {
@@ -210,6 +288,7 @@ impl Default for Config {
             poll: Duration::from_millis(100),
             autosave: Some(Duration::from_secs(6 * 3600)),
             log: Arc::new(|_| {}),
+            events: None,
         }
     }
 }
@@ -262,6 +341,9 @@ struct Volume {
     live: AtomicBool,
     applied: AtomicU64,
     since_save: AtomicU64,
+    /// Bumped whenever `state.index` is replaced wholesale (compaction,
+    /// rescan), which renumbers its entries.
+    generation: AtomicU64,
     /// The snapshot on disk, if any.
     saved: Mutex<Option<Meta>>,
     /// Serializes snapshot writes (they share one temp file).
@@ -424,6 +506,7 @@ fn open_volume(source: &Arc<dyn Source>, cfg: &Config) -> Result<Volume, SourceE
         live: AtomicBool::new(false),
         applied: AtomicU64::new(since_save),
         since_save: AtomicU64::new(since_save),
+        generation: AtomicU64::new(1),
         saved: Mutex::new(saved),
         save_lock: Mutex::new(()),
         write_gate: Mutex::new(()),
@@ -482,6 +565,12 @@ fn open_volume(source: &Arc<dyn Source>, cfg: &Config) -> Result<Volume, SourceE
     Ok(mk(st, usn, None, stats.total() as u64, false))
 }
 
+/// One page of `Engine::list_files`.
+pub enum ListPage {
+    Page { paths: Vec<String>, next: Option<ListCursor> },
+    Restart,
+}
+
 pub struct Hit {
     /// Index into `Engine::volumes()`.
     pub volume: usize,
@@ -501,6 +590,7 @@ pub struct Engine {
     stop: Arc<AtomicBool>,
     tails: Vec<JoinHandle<()>>,
     cfg: Arc<Config>,
+    events: Arc<EventLog>,
 }
 
 impl Engine {
@@ -533,22 +623,24 @@ impl Engine {
                 }),
             }
         }
+        let events = cfg.events.clone().unwrap_or_default();
         let mut engine = Engine {
             vols,
             failures,
             stop: Arc::new(AtomicBool::new(false)),
             tails: Vec::new(),
             cfg,
+            events,
         };
         if engine.cfg.tail {
             for v in engine.vols.iter().filter(|v| !v.stale) {
                 v.live.store(true, Ordering::Release);
-                let (v, stop, cfg) = (v.clone(), engine.stop.clone(), engine.cfg.clone());
+                let (v, stop, cfg, events) = (v.clone(), engine.stop.clone(), engine.cfg.clone(), engine.events.clone());
                 engine.tails.push(
                     thread::Builder::new()
                         .name(format!("tail-{}", v.label))
                         .spawn(move || {
-                            let r = panic::catch_unwind(AssertUnwindSafe(|| tail(&v, &stop, &cfg)));
+                            let r = panic::catch_unwind(AssertUnwindSafe(|| tail(&v, &stop, &cfg, &events)));
                             if r.is_err() {
                                 (cfg.log)(&format!("  {} live updates stopped: internal error", v.label));
                             }
@@ -576,6 +668,7 @@ impl Engine {
                     live: AtomicBool::new(false),
                     applied: AtomicU64::new(0),
                     since_save: AtomicU64::new(0),
+                    generation: AtomicU64::new(1),
                     saved: Mutex::new(None),
                     save_lock: Mutex::new(()),
                     write_gate: Mutex::new(()),
@@ -590,7 +683,70 @@ impl Engine {
             stop: Arc::new(AtomicBool::new(false)),
             tails: Vec::new(),
             cfg: Arc::new(Config::default()),
+            events: Arc::new(EventLog::new()),
         }
+    }
+
+    /// The log the tail threads publish file events to.
+    pub fn events(&self) -> &Arc<EventLog> {
+        &self.events
+    }
+
+    /// Start recording events `f` allows. The journal is read for data writes
+    /// from now on. Returns the log's epoch and the first sequence number.
+    pub fn subscribe(&self, f: Filter) -> (u64, u64) {
+        for v in &self.vols {
+            if let Some(s) = &v.source {
+                s.set_data_events(true);
+            }
+        }
+        self.events.subscribe(f)
+    }
+
+    /// Up to a page of the files `f` allows, starting at `cursor`. The
+    /// listing walks the volumes in order; `next` is `None` after the last
+    /// page, and `Restart` means a volume's index was replaced meanwhile.
+    pub fn list_files(&self, cursor: ListCursor, f: &Filter) -> ListPage {
+        /// Entries looked at per page, so the read lock is held only briefly.
+        const SCAN_BUDGET: usize = 1_500_000;
+        let mut paths = Vec::new();
+        let mut bytes = 0usize;
+        let mut vol = cursor.volume as usize;
+        let mut entry = cursor.entry as usize;
+        let mut generation = cursor.generation;
+        let mut scanned = 0usize;
+        while vol < self.vols.len() {
+            let v = &self.vols[vol];
+            let st = rd(&v.state);
+            let now_gen = v.generation.load(Ordering::Acquire);
+            if entry == 0 {
+                generation = now_gen;
+            } else if generation != now_gen {
+                return ListPage::Restart;
+            }
+            let n = st.index.len();
+            while entry < n {
+                if paths.len() >= MAX_FILES_PER_PAGE || bytes >= FILES_PAGE_BYTES || scanned >= SCAN_BUDGET {
+                    let next = ListCursor { volume: vol as u16, entry: entry as u32, generation };
+                    return ListPage::Page { paths, next: Some(next) };
+                }
+                let i = entry as u32;
+                entry += 1;
+                scanned += 1;
+                if st.index.is_dead(i) || st.index.is_dir(i) || !f.allows_name(st.index.name(i)) {
+                    continue;
+                }
+                let path = st.index.path(i);
+                if f.allows_file(&path) {
+                    bytes += path.len() + 4;
+                    paths.push(path);
+                }
+            }
+            drop(st);
+            vol += 1;
+            entry = 0;
+        }
+        ListPage::Page { paths, next: None }
     }
 
     pub fn volumes(&self) -> Vec<VolumeInfo> {
@@ -735,7 +891,7 @@ fn nap(d: Duration, stop: &AtomicBool) {
     }
 }
 
-fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
+fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config, events: &EventLog) {
     let Some(source) = v.source.as_ref() else {
         return;
     };
@@ -745,8 +901,16 @@ fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
     // Rescans since the last successful read; a journal that is "gone" again
     // right after a fresh scan is not going to get better by scanning more.
     let mut rescans = 0u32;
+    // Whether the journal is being read for data writes (only while the
+    // content indexer listens).
+    let mut data_on = false;
 
     while !stop.load(Ordering::Acquire) {
+        let listener = events.filter();
+        if listener.is_some() != data_on {
+            data_on = listener.is_some();
+            source.set_data_events(data_on);
+        }
         let id = rd(&v.state).journal_id;
         let from = v.next_usn.load(Ordering::Acquire);
         buf.clear();
@@ -762,7 +926,12 @@ fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
                         let _g = gate(&v.write_gate);
                         let mut st = wr(&v.state);
                         for c in &buf {
-                            apply(&mut st.index, c, &mut stats);
+                            match &listener {
+                                Some(f) => apply_with_events(&mut st.index, c, &mut stats, f, events),
+                                // Data-write records are only requested for a listener.
+                                None if c.reason & REASON_MASK != 0 => apply(&mut st.index, c, &mut stats),
+                                None => {}
+                            }
                         }
                         st.index.settle();
                         v.next_usn.fetch_max(next, Ordering::AcqRel);
@@ -777,6 +946,7 @@ fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
                         let dead = rd(&v.state).index.dead_len();
                         let _g = gate(&v.write_gate);
                         wr(&v.state).index = fresh;
+                        v.generation.fetch_add(1, Ordering::AcqRel);
                         log(&format!(
                             "  {} compacted {} dead entries in {}",
                             v.label,
@@ -801,6 +971,7 @@ fn tail(v: &Volume, stop: &AtomicBool, cfg: &Config) {
                         let g = gate(&v.write_gate);
                         let mut st = wr(&v.state);
                         *st = fresh;
+                        v.generation.fetch_add(1, Ordering::AcqRel);
                         v.next_usn.store(usn, Ordering::Release);
                         drop(st);
                         drop(g);
@@ -901,6 +1072,12 @@ mod tests {
                 is_dir,
                 name: name.into(),
             });
+        }
+
+        /// A journal record that does not change the file tree (a data write).
+        fn record(&self, reason: u32, rec: u64, parent: u64, name: &str, is_dir: bool) {
+            let mut fs = self.fs.lock().unwrap();
+            Self::change(&mut fs, reason, rec, parent, name, is_dir);
         }
 
         fn create(&self, rec: u64, parent: u64, name: &str, is_dir: bool) {
@@ -1260,6 +1437,108 @@ mod tests {
         assert!(e.volumes()[0].applied >= 6);
         e.stop();
         assert!(!e.volumes()[0].live);
+    }
+
+    fn txt_filter() -> Filter {
+        Filter {
+            exts: vec!["txt".into()],
+            exclude_components: vec!["skipme".into()],
+            ..Default::default()
+        }
+    }
+
+    /// Everything the log holds from `next`, waiting until `want` events arrived.
+    fn drain(e: &Engine, epoch: u64, mut next: u64, want: usize) -> Vec<crate::events::Event> {
+        let mut got = Vec::new();
+        let t = Instant::now();
+        while got.len() < want && t.elapsed() < Duration::from_secs(3) {
+            let p = e.events().poll(epoch, next, 100, Duration::from_millis(50));
+            next = p.next;
+            got.extend(p.events);
+        }
+        got
+    }
+
+    #[test]
+    fn tail_publishes_file_events_to_a_subscriber() {
+        use crate::usn::{REASON_CLOSE, REASON_DATA_EXTEND};
+        let fake = Fake::new("T1:");
+        let mut c = cfg(None);
+        c.tail = true;
+        let mut e = start(&[&fake], c);
+        let (epoch, next) = e.subscribe(txt_filter());
+
+        // Created but not closed: nothing yet. Closed with data: Changed.
+        fake.create(40, 11, "a.txt", false);
+        fake.record(REASON_DATA_EXTEND | REASON_CLOSE, 40, 11, "a.txt", false);
+        // Other extensions and excluded folders are never reported.
+        fake.create(41, 11, "c.bin", false);
+        fake.record(REASON_DATA_EXTEND | REASON_CLOSE, 41, 11, "c.bin", false);
+        fake.rename(40, 11, "b.txt");
+        fake.rename(40, 11, "b.tmp"); // leaves the wanted set: the old path is deleted
+        fake.rename(40, 11, "c.txt"); // comes back: changed
+        fake.create(42, 11, "skipme", true);
+        fake.create(43, 42, "x.txt", false);
+        fake.record(REASON_DATA_EXTEND | REASON_CLOSE, 43, 42, "x.txt", false);
+        fake.delete(40);
+
+        let ev = drain(&e, epoch, next, 5);
+        let got: Vec<(EventKind, &str, &str)> =
+            ev.iter().map(|x| (x.kind, x.path.as_str(), x.old_path.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (EventKind::Changed, r"T1:\Users\Zach\a.txt", ""),
+                (EventKind::Renamed, r"T1:\Users\Zach\b.txt", r"T1:\Users\Zach\a.txt"),
+                (EventKind::Deleted, r"T1:\Users\Zach\b.txt", ""),
+                (EventKind::Changed, r"T1:\Users\Zach\c.txt", ""),
+                (EventKind::Deleted, r"T1:\Users\Zach\c.txt", ""),
+            ]
+        );
+        // The name index still saw everything.
+        assert_eq!(find(&e, "x.txt").len(), 1);
+        e.stop();
+    }
+
+    #[test]
+    fn nothing_is_recorded_without_a_subscriber() {
+        let fake = Fake::new("T1:");
+        let mut c = cfg(None);
+        c.tail = true;
+        let mut e = start(&[&fake], c);
+        fake.create(40, 11, "a.txt", false);
+        let t = Instant::now();
+        while find(&e, "a.txt").is_empty() && t.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let (epoch, next) = e.subscribe(txt_filter());
+        assert_eq!(next, 1, "an event was recorded before anyone listened");
+        assert!(e.events().poll(epoch, next, 10, Duration::ZERO).events.is_empty());
+        e.stop();
+    }
+
+    #[test]
+    fn listing_files_pages_through_every_volume() {
+        let a = Fake::new("T1:");
+        let b = Fake::new("T2:");
+        b.create(50, 10, "other.txt", false);
+        b.create(51, 10, "skip.bin", false);
+        let e = start(&[&a, &b], cfg(None));
+        let f = txt_filter();
+        let ListPage::Page { mut paths, next } = e.list_files(ListCursor::default(), &f) else {
+            panic!("restart on the first page");
+        };
+        assert!(next.is_none());
+        paths.sort();
+        assert_eq!(paths, [r"T1:\Users\Zach\notes.txt", r"T2:\Users\Zach\notes.txt", r"T2:\Users\other.txt"]);
+
+        // A cursor from before an index swap is refused instead of misread.
+        let stale = ListCursor { volume: 0, entry: 2, generation: 99 };
+        assert!(matches!(e.list_files(stale, &f), ListPage::Restart));
+        // Starting a volume ignores the generation.
+        let fresh = ListCursor { volume: 1, entry: 0, generation: 99 };
+        let ListPage::Page { paths, .. } = e.list_files(fresh, &f) else { panic!() };
+        assert_eq!(paths, [r"T2:\Users\Zach\notes.txt", r"T2:\Users\other.txt"]);
     }
 
     /// A snapshot write (a long read) while the tail has a change to apply

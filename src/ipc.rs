@@ -10,8 +10,12 @@
 
 use std::io::{self, Read, Write};
 
+use crate::events::{
+    Event, EventKind, Filter, MAX_EVENTS_PER_REPLY, MAX_FILTER_ITEM_BYTES, MAX_FILTER_ITEMS, PollState,
+};
+
 /// Bumped when the format changes; the popup refuses a helper that disagrees.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Largest frame either side will accept (a full page of long paths is ~30 KB).
 pub const MAX_FRAME: usize = 1 << 20;
@@ -22,6 +26,25 @@ const OP_STATUS: u8 = 1;
 const OP_SEARCH: u8 = 2;
 const OP_SAVE: u8 = 3;
 const OP_SHUTDOWN: u8 = 4;
+const OP_SUBSCRIBE: u8 = 5;
+const OP_EVENTS: u8 = 6;
+const OP_LIST_FILES: u8 = 7;
+
+/// Longest the helper will hold an `Events` request open waiting for news.
+pub const MAX_EVENT_WAIT_MS: u32 = 10_000;
+/// Soft cap on the bytes of paths in one `Files` reply (frames stop at `MAX_FRAME`).
+pub const FILES_PAGE_BYTES: usize = 600 * 1024;
+pub const MAX_FILES_PER_PAGE: usize = 10_000;
+
+/// Where a file listing stands: the next entry of a volume's index. The
+/// generation changes when that index is replaced (compaction, rescan), which
+/// renumbers entries; a listing cannot continue across that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListCursor {
+    pub volume: u16,
+    pub entry: u32,
+    pub generation: u64,
+}
 
 pub const STATUS_OK: u8 = 0;
 /// The index is still loading; the body is a progress line.
@@ -61,6 +84,21 @@ pub enum Request {
     Save,
     /// Save and exit.
     Shutdown,
+    /// Start recording change events for paths `Filter` allows (replaces any
+    /// earlier filter). Answered with `Subscribed`.
+    Subscribe(Filter),
+    /// Events from sequence number `next` on, waiting up to `wait_ms` if none.
+    Events {
+        epoch: u64,
+        next: u64,
+        max: u16,
+        wait_ms: u32,
+    },
+    /// A page of the files the filter allows, in index order.
+    ListFiles {
+        cursor: ListCursor,
+        filter: Filter,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +123,23 @@ pub enum Reply {
     Status(StatusMsg),
     Hits { total: u64, hits: Vec<HitMsg> },
     Done,
+    Subscribed {
+        epoch: u64,
+        next: u64,
+    },
+    Events {
+        state: PollState,
+        epoch: u64,
+        next: u64,
+        events: Vec<Event>,
+    },
+    /// One page of a listing. `next` is `None` after the last page. `restart`
+    /// means the index changed under the listing: start over (no paths).
+    Files {
+        restart: bool,
+        next: Option<ListCursor>,
+        paths: Vec<String>,
+    },
     /// Index still loading (`detail` says how far).
     Loading(String),
     Error(String),
@@ -140,6 +195,51 @@ impl<'a> Cur<'a> {
     }
 }
 
+fn put_filter(out: &mut Vec<u8>, f: &Filter) {
+    for list in [&f.exts, &f.exclude_components, &f.exclude_prefixes, &f.exclude_fragments, &f.include_prefixes] {
+        out.extend_from_slice(&(list.len() as u16).to_le_bytes());
+        for item in list {
+            put_str(out, item);
+        }
+    }
+    out.push(f.skip_dot_dirs as u8);
+}
+
+impl Cur<'_> {
+    fn list(&mut self, max: usize) -> Result<Vec<String>, BadMessage> {
+        let n = self.u16()? as usize;
+        if n > max {
+            return bad("too many filter items");
+        }
+        (0..n).map(|_| self.str(MAX_FILTER_ITEM_BYTES)).collect()
+    }
+
+    fn filter(&mut self) -> Result<Filter, BadMessage> {
+        Ok(Filter {
+            exts: self.list(MAX_FILTER_ITEMS[0])?,
+            exclude_components: self.list(MAX_FILTER_ITEMS[1])?,
+            exclude_prefixes: self.list(MAX_FILTER_ITEMS[2])?,
+            exclude_fragments: self.list(MAX_FILTER_ITEMS[3])?,
+            include_prefixes: self.list(MAX_FILTER_ITEMS[4])?,
+            skip_dot_dirs: self.u8()? != 0,
+        })
+    }
+
+    fn cursor(&mut self) -> Result<ListCursor, BadMessage> {
+        Ok(ListCursor {
+            volume: self.u16()?,
+            entry: self.u32()?,
+            generation: self.u64()?,
+        })
+    }
+}
+
+fn put_cursor(out: &mut Vec<u8>, c: &ListCursor) {
+    out.extend_from_slice(&c.volume.to_le_bytes());
+    out.extend_from_slice(&c.entry.to_le_bytes());
+    out.extend_from_slice(&c.generation.to_le_bytes());
+}
+
 fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
     out.extend_from_slice(s.as_bytes());
@@ -162,6 +262,22 @@ impl Request {
             }
             Request::Save => out.push(OP_SAVE),
             Request::Shutdown => out.push(OP_SHUTDOWN),
+            Request::Subscribe(f) => {
+                out.push(OP_SUBSCRIBE);
+                put_filter(&mut out, f);
+            }
+            Request::Events { epoch, next, max, wait_ms } => {
+                out.push(OP_EVENTS);
+                out.extend_from_slice(&epoch.to_le_bytes());
+                out.extend_from_slice(&next.to_le_bytes());
+                out.extend_from_slice(&max.to_le_bytes());
+                out.extend_from_slice(&wait_ms.to_le_bytes());
+            }
+            Request::ListFiles { cursor, filter } => {
+                out.push(OP_LIST_FILES);
+                put_cursor(&mut out, cursor);
+                put_filter(&mut out, filter);
+            }
         }
         out
     }
@@ -183,6 +299,17 @@ impl Request {
             }
             OP_SAVE => Request::Save,
             OP_SHUTDOWN => Request::Shutdown,
+            OP_SUBSCRIBE => Request::Subscribe(c.filter()?),
+            OP_EVENTS => Request::Events {
+                epoch: c.u64()?,
+                next: c.u64()?,
+                max: c.u16()?,
+                wait_ms: c.u32()?,
+            },
+            OP_LIST_FILES => Request::ListFiles {
+                cursor: c.cursor()?,
+                filter: c.filter()?,
+            },
             _ => return bad("unknown op"),
         };
         c.done()?;
@@ -216,6 +343,46 @@ impl Reply {
             Reply::Done => {
                 out.push(STATUS_OK);
                 out.push(3);
+            }
+            Reply::Subscribed { epoch, next } => {
+                out.push(STATUS_OK);
+                out.push(4);
+                out.extend_from_slice(&epoch.to_le_bytes());
+                out.extend_from_slice(&next.to_le_bytes());
+            }
+            Reply::Events { state, epoch, next, events } => {
+                out.push(STATUS_OK);
+                out.push(5);
+                out.push(match state {
+                    PollState::Ok => 0,
+                    PollState::Lost => 1,
+                    PollState::NewEpoch => 2,
+                    PollState::NotSubscribed => 3,
+                });
+                out.extend_from_slice(&epoch.to_le_bytes());
+                out.extend_from_slice(&next.to_le_bytes());
+                out.extend_from_slice(&(events.len() as u32).to_le_bytes());
+                for e in events {
+                    out.extend_from_slice(&e.seq.to_le_bytes());
+                    let kind = match e.kind {
+                        EventKind::Changed => 0u8,
+                        EventKind::Deleted => 1,
+                        EventKind::Renamed => 2,
+                    };
+                    out.push(kind | (e.is_dir as u8) << 4);
+                    put_str(&mut out, &e.path);
+                    put_str(&mut out, &e.old_path);
+                }
+            }
+            Reply::Files { restart, next, paths } => {
+                out.push(STATUS_OK);
+                out.push(6);
+                out.push(*restart as u8 | (next.is_some() as u8) << 1);
+                put_cursor(&mut out, &next.unwrap_or_default());
+                out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+                for p in paths {
+                    put_str(&mut out, p);
+                }
             }
             Reply::Loading(s) => {
                 out.push(STATUS_LOADING);
@@ -263,6 +430,61 @@ impl Reply {
                     Reply::Hits { total, hits }
                 }
                 3 => Reply::Done,
+                4 => Reply::Subscribed {
+                    epoch: c.u64()?,
+                    next: c.u64()?,
+                },
+                5 => {
+                    let state = match c.u8()? {
+                        0 => PollState::Ok,
+                        1 => PollState::Lost,
+                        2 => PollState::NewEpoch,
+                        3 => PollState::NotSubscribed,
+                        _ => return bad("unknown poll state"),
+                    };
+                    let epoch = c.u64()?;
+                    let next = c.u64()?;
+                    let n = c.u32()? as usize;
+                    if n > MAX_EVENTS_PER_REPLY {
+                        return bad("too many events");
+                    }
+                    let mut events = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let seq = c.u64()?;
+                        let b = c.u8()?;
+                        let kind = match b & 0x0F {
+                            0 => EventKind::Changed,
+                            1 => EventKind::Deleted,
+                            2 => EventKind::Renamed,
+                            _ => return bad("unknown event kind"),
+                        };
+                        events.push(Event {
+                            seq,
+                            kind,
+                            is_dir: b & 0x10 != 0,
+                            path: c.str(MAX_FRAME)?,
+                            old_path: c.str(MAX_FRAME)?,
+                        });
+                    }
+                    Reply::Events { state, epoch, next, events }
+                }
+                6 => {
+                    let flags = c.u8()?;
+                    let cur = c.cursor()?;
+                    let n = c.u32()? as usize;
+                    if n > MAX_FILES_PER_PAGE {
+                        return bad("too many paths");
+                    }
+                    let mut paths = Vec::with_capacity(n.min(1024));
+                    for _ in 0..n {
+                        paths.push(c.str(MAX_FRAME)?);
+                    }
+                    Reply::Files {
+                        restart: flags & 1 != 0,
+                        next: (flags & 2 != 0).then_some(cur),
+                        paths,
+                    }
+                }
                 _ => return bad("unknown reply body"),
             },
             STATUS_LOADING => Reply::Loading(c.str(MAX_FRAME)?),
@@ -329,6 +551,19 @@ mod tests {
                 limit: 0,
                 kind: KindFilter::Any,
             },
+            Request::Subscribe(Filter {
+                exts: vec!["txt".into(), "md".into()],
+                exclude_components: vec!["node_modules".into()],
+                exclude_prefixes: vec!["\\windows\\".into()],
+                exclude_fragments: vec![],
+                include_prefixes: vec!["c:\\users\\".into()],
+                skip_dot_dirs: true,
+            }),
+            Request::Events { epoch: 7, next: 99, max: 500, wait_ms: 1500 },
+            Request::ListFiles {
+                cursor: ListCursor { volume: 1, entry: 123_456, generation: 9 },
+                filter: Filter::default(),
+            },
         ] {
             assert_eq!(Request::decode(&r.encode()).unwrap(), r);
         }
@@ -348,6 +583,23 @@ mod tests {
                 stale: false,
                 detail: "C: 12 changes applied".into(),
             }),
+            Reply::Subscribed { epoch: 5, next: 1 },
+            Reply::Events {
+                state: PollState::Ok,
+                epoch: 5,
+                next: 12,
+                events: vec![
+                    Event { seq: 10, kind: EventKind::Changed, is_dir: false, path: "C:\\a.txt".into(), old_path: String::new() },
+                    Event { seq: 11, kind: EventKind::Renamed, is_dir: true, path: "C:\\b".into(), old_path: "C:\\a".into() },
+                ],
+            },
+            Reply::Events { state: PollState::Lost, epoch: 1, next: 2, events: vec![] },
+            Reply::Files {
+                restart: false,
+                next: Some(ListCursor { volume: 0, entry: 77, generation: 3 }),
+                paths: vec!["C:\\x.txt".into(), "D:\\y.md".into()],
+            },
+            Reply::Files { restart: true, next: None, paths: vec![] },
             Reply::Hits {
                 total: 123_456,
                 hits: vec![
@@ -392,6 +644,24 @@ mod tests {
         many.extend_from_slice(&0u64.to_le_bytes());
         many.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(Reply::decode(&many).is_err());
+    }
+
+    #[test]
+    fn oversized_filters_are_refused() {
+        let too_many = Filter {
+            exclude_fragments: (0..MAX_FILTER_ITEMS[3] + 1).map(|i| format!("frag{i}")).collect(),
+            ..Default::default()
+        };
+        assert!(Request::decode(&Request::Subscribe(too_many).encode()).is_err());
+        let too_long = Filter { exts: vec!["x".repeat(MAX_FILTER_ITEM_BYTES + 1)], ..Default::default() };
+        assert!(Request::decode(&Request::Subscribe(too_long).encode()).is_err());
+        // Right at the limits is fine.
+        let at_limit = Filter {
+            exclude_fragments: (0..MAX_FILTER_ITEMS[3]).map(|i| format!("frag{i}")).collect(),
+            exts: vec!["x".repeat(MAX_FILTER_ITEM_BYTES)],
+            ..Default::default()
+        };
+        assert!(Request::decode(&Request::Subscribe(at_limit).encode()).is_ok());
     }
 
     #[test]
