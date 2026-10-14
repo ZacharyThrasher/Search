@@ -43,6 +43,7 @@ $lines = New-Object System.Collections.Generic.List[string]
 function Log([string]$s) { Write-Host $s; $lines.Add($s) }
 
 function RunS([string[]]$sArgs) {
+    $sArgs = @('--no-snapshot') + $sArgs   # measure real scans, never a saved snapshot
     Log ""
     Log "> s.exe $($sArgs -join ' ')"
     & $exe @sArgs 2>&1 | ForEach-Object { Log ("$_") }

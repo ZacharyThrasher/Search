@@ -1,8 +1,10 @@
-//! Parser for the buffers returned by `FSCTL_ENUM_USN_DATA`.
+//! Parser for the buffers returned by `FSCTL_ENUM_USN_DATA` and
+//! `FSCTL_READ_USN_JOURNAL`.
 //!
-//! The kernel hands back an 8-byte "next file reference number" followed by a
-//! packed run of `USN_RECORD_V2` structures. Everything here is bounds-checked
-//! and platform-independent so it can be unit-tested (and fuzzed) without a
+//! Both hand back an 8-byte header (the next file reference number for
+//! enumeration, the next USN for journal reads) followed by a packed run of
+//! `USN_RECORD_V2` structures. Everything here is bounds-checked and
+//! platform-independent so it can be unit-tested (and fuzzed) without a
 //! volume handle.
 
 use std::fmt;
@@ -14,20 +16,35 @@ pub const ATTR_DIRECTORY: u32 = 0x10;
 /// the top 16 bits are a reuse sequence number.
 pub const FRN_RECORD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
+/// `USN_REASON_*` bits the live index cares about.
+pub const REASON_FILE_CREATE: u32 = 0x0000_0100;
+pub const REASON_FILE_DELETE: u32 = 0x0000_0200;
+pub const REASON_RENAME_OLD_NAME: u32 = 0x0000_1000;
+pub const REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
+/// Journal reads are filtered to these in the kernel, so data writes and
+/// attribute changes (the bulk of the traffic) never reach us.
+pub const REASON_MASK: u32 = REASON_FILE_CREATE | REASON_FILE_DELETE | REASON_RENAME_NEW_NAME;
+
 const HEADER_LEN: usize = 60; // fixed part of USN_RECORD_V2, up to the name
 const OFF_MAJOR: usize = 4;
 const OFF_FRN: usize = 8;
 const OFF_PARENT: usize = 16;
+const OFF_USN: usize = 24;
+const OFF_REASON: usize = 40;
 const OFF_ATTRS: usize = 52;
 const OFF_NAME_LEN: usize = 56;
 const OFF_NAME_OFF: usize = 58;
 
-/// One decoded enumeration record. `name` is raw UTF-16LE bytes borrowed from
-/// the buffer (not guaranteed 2-byte aligned, so we never reinterpret it).
+/// One decoded record. `name` is raw UTF-16LE bytes borrowed from the buffer
+/// (not guaranteed 2-byte aligned, so we never reinterpret it).
 #[derive(Debug, Clone, Copy)]
 pub struct UsnEntry<'a> {
     pub record: u64,
     pub parent: u64,
+    /// This record's position in the journal.
+    pub usn: i64,
+    /// `USN_REASON_*` bits (always the cumulative set for journal records).
+    pub reason: u32,
     pub attributes: u32,
     pub name_utf16le: &'a [u8],
 }
@@ -136,6 +153,8 @@ pub fn parse_enum_buffer<'a>(
             each(UsnEntry {
                 record: u64_at(rec, OFF_FRN) & FRN_RECORD_MASK,
                 parent: u64_at(rec, OFF_PARENT) & FRN_RECORD_MASK,
+                usn: u64_at(rec, OFF_USN) as i64,
+                reason: u32_at(rec, OFF_REASON),
                 attributes: u32_at(rec, OFF_ATTRS),
                 name_utf16le: &rec[name_off..name_off + name_len],
             });
@@ -147,10 +166,32 @@ pub fn parse_enum_buffer<'a>(
     Ok(next)
 }
 
+/// Walk one `FSCTL_READ_USN_JOURNAL` output buffer. Same record layout as
+/// enumeration; the header is the USN to pass as `StartUsn` next time.
+pub fn parse_journal_buffer<'a>(
+    buf: &'a [u8],
+    each: impl FnMut(UsnEntry<'a>),
+) -> Result<i64, ParseError> {
+    parse_enum_buffer(buf, each).map(|n| n as i64)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     /// Build a V2 record for tests.
     pub fn record(frn: u64, parent: u64, attrs: u32, name: &str, major: u16) -> Vec<u8> {
+        journal_record(frn, parent, 0, 0, attrs, name, major)
+    }
+
+    /// Build a V2 record with journal fields for tests.
+    pub fn journal_record(
+        frn: u64,
+        parent: u64,
+        usn: i64,
+        reason: u32,
+        attrs: u32,
+        name: &str,
+        major: u16,
+    ) -> Vec<u8> {
         let units: Vec<u16> = name.encode_utf16().collect();
         let name_len = units.len() * 2;
         let len = (60 + name_len + 7) & !7;
@@ -159,6 +200,8 @@ pub(crate) mod test_support {
         r[4..6].copy_from_slice(&major.to_le_bytes());
         r[8..16].copy_from_slice(&frn.to_le_bytes());
         r[16..24].copy_from_slice(&parent.to_le_bytes());
+        r[24..32].copy_from_slice(&usn.to_le_bytes());
+        r[40..44].copy_from_slice(&reason.to_le_bytes());
         r[52..56].copy_from_slice(&attrs.to_le_bytes());
         r[56..58].copy_from_slice(&(name_len as u16).to_le_bytes());
         r[58..60].copy_from_slice(&60u16.to_le_bytes());
@@ -182,7 +225,9 @@ mod tests {
     use super::test_support::*;
     use super::*;
 
-    fn collect(buf: &[u8]) -> Result<(u64, Vec<(u64, u64, bool, String)>), ParseError> {
+    type Row = (u64, u64, bool, String);
+
+    fn collect(buf: &[u8]) -> Result<(u64, Vec<Row>), ParseError> {
         let mut v = Vec::new();
         let mut s = String::new();
         let next = parse_enum_buffer(buf, |e| {
@@ -206,6 +251,27 @@ mod tests {
         assert_eq!(next, 99);
         assert_eq!(v[0], (100, 5, true, "Docs".into()));
         assert_eq!(v[1], (101, 100, false, "résumé 📄.txt".into()));
+    }
+
+    #[test]
+    fn journal_buffer_carries_usn_and_reason() {
+        let b = buffer(
+            5000,
+            &[
+                journal_record(40, 5, 4096, REASON_FILE_CREATE, 0x20, "new.txt", 2),
+                journal_record(40, 5, 4200, REASON_RENAME_NEW_NAME | 0x8000_0000, 0x20, "n2.txt", 2),
+            ],
+        );
+        let mut seen = Vec::new();
+        let next = parse_journal_buffer(&b, |e| seen.push((e.usn, e.reason, e.record))).unwrap();
+        assert_eq!(next, 5000);
+        assert_eq!(
+            seen,
+            [
+                (4096, REASON_FILE_CREATE, 40),
+                (4200, REASON_RENAME_NEW_NAME | 0x8000_0000, 40)
+            ]
+        );
     }
 
     #[test]
