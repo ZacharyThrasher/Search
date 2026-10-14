@@ -67,6 +67,114 @@ mod imp {
         walk: Vec<PathBuf>,
     }
 
+    /// A hidden top-level window whose only job is to hear Windows say "the
+    /// session is ending" (WM_ENDSESSION) or "please close" (WM_CLOSE, which
+    /// Task Scheduler sends when it stops a task), and turn that into a clean
+    /// save-and-exit. Services and message-only windows never get these.
+    mod session {
+        use std::ptr::{null, null_mut};
+        use std::sync::OnceLock;
+        use std::sync::mpsc::Sender;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::System::Threading::SetProcessShutdownParameters;
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+        static QUIT: OnceLock<Mutex<Sender<()>>> = OnceLock::new();
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain([0]).collect()
+        }
+
+        fn request_quit() {
+            if let Some(q) = QUIT.get() {
+                let _ = q.lock().unwrap_or_else(|e| e.into_inner()).send(());
+            }
+        }
+
+        unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            // SAFETY: called by the system on the watcher thread.
+            unsafe {
+                match msg {
+                    WM_QUERYENDSESSION => 1, // fine with ending; we save in WM_ENDSESSION
+                    WM_ENDSESSION => {
+                        if wp != 0 {
+                            request_quit();
+                            // The main thread saves and exits the process; give it
+                            // the time Windows allows before it kills us anyway.
+                            let t = Instant::now();
+                            while t.elapsed() < Duration::from_secs(10) {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                        0
+                    }
+                    WM_CLOSE => {
+                        request_quit();
+                        0
+                    }
+                    _ => DefWindowProcW(hwnd, msg, wp, lp),
+                }
+            }
+        }
+
+        /// `title` is `searchd-<tag>`, so a test can find its own helper.
+        pub fn start(title: String, quit: Sender<()>, log: std::sync::Arc<super::Log>) {
+            let _ = QUIT.set(Mutex::new(quit));
+            let _ = std::thread::Builder::new().name("session-watch".into()).spawn(move || {
+                // SAFETY: plain window-class registration and a message loop on this thread.
+                unsafe {
+                    // Be told about shutdown early, so there is time to write snapshots.
+                    SetProcessShutdownParameters(0x3FF, 0);
+                    let hinst = GetModuleHandleW(null());
+                    let class = wide("SearchdSessionWatcher");
+                    let wc = WNDCLASSEXW {
+                        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                        style: 0,
+                        lpfnWndProc: Some(proc),
+                        cbClsExtra: 0,
+                        cbWndExtra: 0,
+                        hInstance: hinst,
+                        hIcon: null_mut(),
+                        hCursor: null_mut(),
+                        hbrBackground: null_mut(),
+                        lpszMenuName: null(),
+                        lpszClassName: class.as_ptr(),
+                        hIconSm: null_mut(),
+                    };
+                    RegisterClassExW(&wc);
+                    // Top-level (not message-only) and never shown.
+                    let hwnd = CreateWindowExW(
+                        WS_EX_TOOLWINDOW,
+                        class.as_ptr(),
+                        wide(&title).as_ptr(),
+                        WS_OVERLAPPED,
+                        0,
+                        0,
+                        0,
+                        0,
+                        null_mut(),
+                        null_mut(),
+                        hinst,
+                        null(),
+                    );
+                    if hwnd.is_null() {
+                        log.line("could not create the session window: no save when Windows logs off or Task Scheduler stops this");
+                        return;
+                    }
+                    let mut msg: MSG = std::mem::zeroed();
+                    while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            });
+        }
+    }
+
     struct Log {
         file: Mutex<Option<std::fs::File>>,
         echo: bool,
@@ -208,6 +316,11 @@ mod imp {
         ));
 
         let (quit_tx, quit_rx) = mpsc::channel();
+        session::start(
+            format!("searchd-{}", cli.pipe_tag.as_deref().unwrap_or("main")),
+            quit_tx.clone(),
+            log.clone(),
+        );
         let shared = Arc::new(Shared {
             engine: RwLock::new(None),
             progress: Mutex::new("starting".into()),
@@ -331,8 +444,24 @@ mod imp {
         ));
         *shared.engine.write().unwrap_or_else(|e| e.into_inner()) = Some(engine.clone());
 
-        // Serve until asked to quit (the task being stopped just kills us; the
-        // journal replay on the next start covers anything not saved).
+        // A volume that had to be scanned (first run, or its snapshot was no use)
+        // gets a snapshot now rather than at the next hourly check. Volumes that
+        // resumed from a good snapshot are left alone (SavePolicy: only when
+        // there is none, enough changed, or it is old). Queries keep working.
+        {
+            let (engine, log) = (engine.clone(), log.clone());
+            let _ = std::thread::Builder::new().name("first-save".into()).spawn(move || {
+                let n = engine.save(SavePolicy::default());
+                if n > 0 {
+                    log.line(&format!("wrote {n} snapshot(s) after the scan"));
+                }
+            });
+        }
+
+        // Serve until asked to quit: the `Shutdown` request, Windows ending the
+        // session, or Task Scheduler asking the window to close. A hard kill
+        // (`schtasks /end` on a stuck process, power loss) skips the save; the
+        // journal replay on the next start covers it.
         let _ = quit_rx.recv();
         log.line("shutdown requested; saving");
         let n = engine.save(SavePolicy {
