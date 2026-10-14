@@ -106,6 +106,11 @@ if ($HelperStep) {
 
 # ------------------------------------------------------------- normal half
 try {
+    # The popup and indexer must not run elevated; they start from this half. (The helper part
+    # below asks for administrator rights by itself.)
+    if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'run this from a normal (non-administrator) PowerShell window; the helper step asks for administrator rights by itself'
+    }
     $user = "$env:USERDOMAIN\$env:USERNAME"
     $release = Join-Path $repo 'target\release'
     if (-not $NoBuild) {

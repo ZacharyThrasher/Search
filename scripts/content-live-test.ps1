@@ -26,8 +26,12 @@
 #>
 param(
     [string]$Volume = 'C',
-    [string]$TestDir = (Join-Path $env:TEMP 'search-content-live-test'),
-    [int]$TimeoutSec = 40
+    # A fresh, unpredictable folder (this script is elevated: it must not delete or write through
+    # a folder name another process could have prepared). An explicit one must not exist yet.
+    [string]$TestDir = (Join-Path $env:TEMP "search-content-live-test-$([guid]::NewGuid().ToString('N'))"),
+    [int]$TimeoutSec = 40,
+    # Skip the (elevated) build: verify-and-install.ps1 has just built as your normal user.
+    [switch]$NoBuild
 )
 
 $repo = Split-Path -Parent $PSScriptRoot
@@ -37,6 +41,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
         '-Volume', $Volume, '-TestDir', "`"$TestDir`"", '-TimeoutSec', $TimeoutSec)
+    if ($NoBuild) { $argList += '-NoBuild' }
     $p = Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $argList -Wait -PassThru
     exit $p.ExitCode
 }
@@ -48,27 +53,63 @@ $out = "bench-results\content-live-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
 $lines = New-Object System.Collections.Generic.List[string]
 function Log([string]$s) { Write-Host $s; $lines.Add($s) }
 
-cargo build --release
-if ($LASTEXITCODE -ne 0) { if (-not $env:SEARCH_RUNNER) { Read-Host 'build failed, press Enter' }; exit 1 }
+if (-not $NoBuild) {
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) { if (-not $env:SEARCH_RUNNER) { Read-Host 'build failed, press Enter' }; exit 1 }
+}
 $target = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
 $bin = Join-Path $target 'release'
 
-$work = Join-Path $env:TEMP "search-content-live-$PID"
-Remove-Item -Recurse -Force $work, $TestDir -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force (Join-Path $work 'helper'), (Join-Path $work 'content'), $TestDir | Out-Null
-# Index exactly what we ask for: no default folder exclusions (the temp folder is one of them).
-Set-Content -Path (Join-Path $work 'config.toml') -Value "[content]`ndefault_excludes = false`nworkers = 1`n" -Encoding UTF8
+# Every folder here is new (unpredictable name, refused if it exists), because this part of
+# the script is elevated. The helper is elevated too, so its snapshots and log go in an
+# admin-write-only folder under Program Files, never in a folder a normal process could redirect
+# with a junction or link. The indexer is NOT elevated (see Start-Unelevated); its index lives in
+# the user's temp folder.
+if (Test-Path -LiteralPath $TestDir) { Log "refusing to use $TestDir: it already exists"; exit 1 }
+$id = [guid]::NewGuid().ToString('N')
+$work = Join-Path $env:TEMP "search-content-live-$id"
+$helperDir = Join-Path (Join-Path $env:ProgramFiles 'Search') "livetest-$id"
+New-Item -ItemType Directory (Join-Path $work 'content'), $TestDir | Out-Null
+New-Item -ItemType Directory -Force (Split-Path -Parent $helperDir) | Out-Null
+New-Item -ItemType Directory $helperDir | Out-Null
+& icacls.exe $helperDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) { Log 'FAIL: could not lock down the helper folder'; exit 1 }
+# Index exactly the test folder (and with no default exclusions: the temp folder is one of them).
+# Without include_paths it would crawl every file on the volume.
+$tomlDir = $TestDir.Replace('\', '\\')
+Set-Content -Path (Join-Path $work 'config.toml') -Value "[content]`ndefault_excludes = false`nworkers = 1`ninclude_paths = [`"$tomlDir`"]`n" -Encoding UTF8
 $tag = 'ctest'
 
 Log "# $(Get-Date -Format o)  host=$env:COMPUTERNAME  commit=$(git rev-parse --short HEAD)"
-Log "# volume=$Volume  test dir=$TestDir  work=$work"
+Log "# volume=$Volume  test dir=$TestDir  work=$work  helper data=$helperDir"
+
+# Start a program as the normal user from this elevated script: a scheduled task that runs at the
+# limited run level in your own session. (Start-Process would hand it this script's admin token.)
+$taskName = "SearchContentLiveTest-$id"
+function Start-Unelevated([string]$exe, [string]$arguments) {
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $action = New-ScheduledTaskAction -Execute $exe -Argument $arguments
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName
+}
+function Cleanup {
+    & (Join-Path $bin 'searchi.exe') --stop --dir (Join-Path $work 'content') | Out-Null
+    Start-Sleep -Seconds 2
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Get-Process searchi -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$bin*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+    & (Join-Path $bin 'searchq.exe') --pipe-tag $tag --shutdown | Out-Null
+    Start-Sleep -Seconds 1
+    if ($helper) { Stop-Process -Id $helper.Id -Force -ErrorAction SilentlyContinue }
+    Remove-Item -Recurse -Force $work, $TestDir, $helperDir -ErrorAction SilentlyContinue
+}
 
 $helper = Start-Process -FilePath (Join-Path $bin 'searchd.exe') -WindowStyle Hidden -PassThru `
-    -ArgumentList @('--pipe-tag', $tag, '--data-dir', (Join-Path $work 'helper'), '-v', $Volume)
+    -ArgumentList @('--pipe-tag', $tag, '--data-dir', $helperDir, '-v', $Volume)
 & (Join-Path $bin 'searchq.exe') --pipe-tag $tag --status --wait 900 | Out-Null
-if ($LASTEXITCODE -ne 0) { Log 'FAIL: the helper did not come up'; Stop-Process -Id $helper.Id -Force; exit 1 }
-$indexer = Start-Process -FilePath (Join-Path $bin 'searchi.exe') -WindowStyle Hidden -PassThru `
-    -ArgumentList @('--pipe-tag', $tag, '--dir', (Join-Path $work 'content'), '--config', (Join-Path $work 'config.toml'), '--no-pause')
+if ($LASTEXITCODE -ne 0) { Log 'FAIL: the helper did not come up'; Cleanup; exit 1 }
+Start-Unelevated (Join-Path $bin 'searchi.exe') ("--pipe-tag $tag --dir `"$(Join-Path $work 'content')`" --config `"$(Join-Path $work 'config.toml')`" --no-pause")
 
 $failed = 0
 function Search([string]$q) {
@@ -147,14 +188,7 @@ $prog = Get-Content $status -Raw | ConvertFrom-Json
 Log "indexer: $($prog.indexed) files indexed, $($prog.passages) passages, phase '$($prog.phase)'"
 Log ($(if ($failed -eq 0) { 'ALL PASSED' } else { "$failed STEP(S) FAILED" }))
 
-& (Join-Path $bin 'searchi.exe') --stop --dir (Join-Path $work 'content') | Out-Null
-Start-Sleep -Seconds 2
-Stop-Process -Id $indexer.Id -Force -ErrorAction SilentlyContinue
-& (Join-Path $bin 'searchq.exe') --pipe-tag $tag --shutdown | Out-Null
-Start-Sleep -Seconds 1
-Stop-Process -Id $helper.Id -Force -ErrorAction SilentlyContinue
-Get-Process searchi -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$bin*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force $work, $TestDir -ErrorAction SilentlyContinue
+Cleanup
 $lines | Set-Content $out -Encoding UTF8
 if (-not $env:SEARCH_RUNNER) { Read-Host 'Press Enter to close' | Out-Null }
 exit $failed

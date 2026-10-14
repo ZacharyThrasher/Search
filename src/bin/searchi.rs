@@ -126,6 +126,13 @@ mod imp {
     pub fn main() {
         search::sys::quiet_errors();
         let cli = Cli::parse();
+        // The indexer and its extractors parse untrusted files: never with administrator rights
+        // (an elevated shell, or a script that was run elevated, must not start one by accident).
+        if search::sys::is_elevated() {
+            let _ = search::sys::attach_parent_console();
+            eprintln!("searchi refuses to run elevated: start it from a normal (non-administrator) window.");
+            exit(1);
+        }
         let echo = cli.console && search::sys::attach_parent_console();
         if cli.worker {
             if let Err(e) = worker::run_child() {

@@ -35,7 +35,8 @@ if ($Elevated) {
     try {
         $env:SEARCH_RUNNER = '1'   # no "press Enter" pauses inside the child scripts
         if (-not $SkipLiveTest) {
-            & (Join-Path $PSScriptRoot 'content-live-test.ps1')
+            # -NoBuild: it was built a moment ago as your normal user; no build tools run elevated.
+            & (Join-Path $PSScriptRoot 'content-live-test.ps1') -NoBuild
             if ($LASTEXITCODE -ne 0) { Write-Host 'LIVE TEST FAILED: nothing was installed.' -ForegroundColor Red; Read-Host 'Press Enter to close' | Out-Null; exit 2 }
         }
         & (Join-Path $PSScriptRoot 'install.ps1') -HelperStep -Src $Src -User $User
@@ -47,6 +48,12 @@ if ($Elevated) {
     }
 }
 
+# The popup and indexer are started by the second half of this script, so it must be a normal
+# user's: from an administrator window they would start elevated (searchi refuses to).
+if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host 'Run this from a normal (non-administrator) PowerShell window. It asks for administrator rights itself, once, for the helper part only.' -ForegroundColor Red
+    exit 1
+}
 Set-Location $repo
 if (-not $NoBuild) {
     cargo build --release
