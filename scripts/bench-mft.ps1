@@ -50,7 +50,7 @@ function RunS([string[]]$sArgs) {
 }
 
 cargo build --release
-if ($LASTEXITCODE -ne 0) { Read-Host 'build failed, press Enter'; exit 1 }
+if ($LASTEXITCODE -ne 0) { if (-not $env:SEARCH_RUNNER) { Read-Host 'build failed, press Enter' }; exit 1 }
 $exe = Join-Path (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory 'release\s.exe'
 
 Log "# $(Get-Date -Format o)  host=$env:COMPUTERNAME  commit=$(git rev-parse --short HEAD)"
@@ -76,4 +76,4 @@ RunS (@('--source', 'mft') + $volArgs + @('--bench', "$Runs", '--queries-file', 
 
 Set-Content -Path $out -Value $lines -Encoding UTF8
 Write-Host "`nSaved to $out"
-Read-Host 'Press Enter to close'
+if (-not $env:SEARCH_RUNNER) { Read-Host 'Press Enter to close' }   # the admin runner sets SEARCH_RUNNER: no console to wait on

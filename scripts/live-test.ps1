@@ -51,7 +51,7 @@ if (Test-Path $snap) { Remove-Item -Recurse -Force $snap }
 New-Item -ItemType Directory -Force $snap | Out-Null
 
 cargo build --release
-if ($LASTEXITCODE -ne 0) { Read-Host 'build failed, press Enter'; exit 1 }
+if ($LASTEXITCODE -ne 0) { if (-not $env:SEARCH_RUNNER) { Read-Host 'build failed, press Enter' }; exit 1 }
 $exe = Join-Path (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory 'release\s.exe'
 
 Log "# $(Get-Date -Format o)  host=$env:COMPUTERNAME  commit=$(git rev-parse --short HEAD)"
@@ -132,4 +132,4 @@ Log ""
 if ($failures.Count -eq 0) { Log "RESULT: PASS" } else { Log "RESULT: FAIL"; $failures | ForEach-Object { Log "  - $_" } }
 Set-Content -Path $out -Value $lines -Encoding UTF8
 Write-Host "`nSaved to $((Resolve-Path $out).Path)"
-Read-Host 'Press Enter to close'
+if (-not $env:SEARCH_RUNNER) { Read-Host 'Press Enter to close' }   # the admin runner sets SEARCH_RUNNER: no console to wait on
