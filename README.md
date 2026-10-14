@@ -20,7 +20,7 @@ cargo build --release
 .\target\release\s.exe notepad
 .\target\release\s.exe -v C -v E --bench 200 --queries-file benches\queries.txt
 
-# Or let the script self-elevate and save results to bench-results\
+# Or let the script self-elevate and save results to bench-results\ (serial vs parallel, thread sweep, query bench)
 .\scripts\bench-mft.ps1
 
 # No elevation: walk folders instead

@@ -69,10 +69,15 @@ struct Cli {
     #[arg(short, long)]
     quiet: bool,
 
-    /// Threads reading the MFT per volume (1 = serial, 0 = one per core).
+    /// Threads reading the MFT per volume (1 = serial, 0 = default of 8).
     #[arg(long, value_name = "N", default_value_t = 0)]
     mft_threads: usize,
 }
+
+/// Measured on a 32-thread Ryzen: C: (14.8M records) reads in 14.6 s at 8
+/// threads but 17 s at 32, because NTFS contends on the volume.
+#[cfg(windows)]
+const DEFAULT_MFT_THREADS: usize = 8;
 
 fn fmt_dur(d: Duration) -> String {
     let us = d.as_secs_f64() * 1e6;
@@ -124,7 +129,7 @@ fn build_mft(cli: &Cli, builder: &mut Builder) -> Result<usize, String> {
     let mut done = 0;
     for letter in letters {
         let threads = if cli.mft_threads == 0 {
-            rayon::current_num_threads()
+            DEFAULT_MFT_THREADS.min(rayon::current_num_threads())
         } else {
             cli.mft_threads
         };
